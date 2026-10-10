@@ -1,0 +1,194 @@
+import { type HttpMonitor, type TcpMonitor, activeMonitors, resolveSecret } from './config.ts'
+import { refreshAdminConfig, type Deps } from './deps.ts'
+import { type CheckResult, USER_AGENT, isDue, runHttpCheck, runPool } from './evaluate/http.ts'
+import { runTcpCheck } from './evaluate/tcp.ts'
+import { evaluatePush } from './evaluate/push.ts'
+import { runExpiryChecks } from './expiry/run.ts'
+import { dispatchNotifications } from './notify/dispatch.ts'
+import { dispatchSubscriberOutbox, enqueueIncidentSubscribers } from './subscribers.ts'
+import { activeMaintenance } from './maintenance.ts'
+import { rollupLatency } from './latency.ts'
+import { confirmFailure } from './confirmation.ts'
+import { maybeRunRetention } from './retention.ts'
+import { ensureSchema } from './schema.ts'
+import { type MonitorStateRow, applyTransition, loadStates } from './state.ts'
+import { syncConfig } from './sync.ts'
+import { nowSeconds } from './util/time.ts'
+
+export interface TickSummary {
+  tickAt: number
+  duplicate: boolean
+  transitions: number
+  checks: number
+  skippedChecks: string[]
+  notifications: number
+}
+
+const HTTP_CONCURRENCY = 5 // Workers allow 6 simultaneous outbound connections.
+
+async function applyCheckResult(deps: Deps, m: HttpMonitor | TcpMonitor, s: MonitorStateRow, r: CheckResult, now: number, allowDown = true) {
+  if (r.ok) {
+    if (s.status === 'up' && s.consecutive_fail === 0) return false
+    return applyTransition(deps.db, {
+      monitorId: m.id,
+      fromVersion: s.version,
+      to: 'up',
+      at: now,
+      maintenance: activeMaintenance(deps.config.maintenance, m.id, now).length > 0,
+      set: { consecutive_fail: 0, last_error: null },
+    })
+  }
+  if (s.status === 'down') return false // already down; save the write
+  const fails = s.consecutive_fail + 1
+  if (fails > m.retries && allowDown) {
+    return applyTransition(deps.db, {
+      monitorId: m.id,
+      fromVersion: s.version,
+      to: 'down',
+      reason: 'check_failed',
+      detail: r.err,
+      at: now,
+      maintenance: activeMaintenance(deps.config.maintenance, m.id, now).length > 0,
+      set: { consecutive_fail: fails, last_error: r.err },
+    })
+  }
+  await applyTransition(deps.db, {
+    monitorId: m.id,
+    fromVersion: s.version,
+    at: now,
+    set: { consecutive_fail: fails, last_error: r.err },
+  })
+  return false
+}
+
+async function pingPeer(deps: Deps): Promise<void> {
+  const { pingUrl } = deps.config.peer
+  if (!pingUrl) return
+  let url: string | undefined
+  try {
+    url = resolveSecret(pingUrl, deps.getEnv)
+    if (!url) return
+    const res = await deps.fetch(url, {
+      method: 'POST',
+      headers: { 'user-agent': USER_AGENT },
+      signal: AbortSignal.timeout(5000),
+    })
+    res.body?.cancel().catch(() => {})
+    if (!res.ok) deps.log('warn', 'peer heartbeat rejected', { status: res.status })
+  } catch (e) {
+    deps.log('warn', 'peer heartbeat failed', { error: (e as Error).message })
+  }
+}
+
+/**
+ * One evaluation cycle. Called every minute by the platform scheduler. Idempotent per minute:
+ * a duplicate delivery of the same minute is detected by claiming the `tick_results` row.
+ */
+export async function tick(deps: Deps, nowMs: number = Date.now()): Promise<TickSummary> {
+  const startedMs = Date.now()
+  const now = nowSeconds(nowMs)
+  const tickAt = now - (now % 60)
+  const summary: TickSummary = { tickAt, duplicate: false, transitions: 0, checks: 0, skippedChecks: [], notifications: 0 }
+
+  await ensureSchema(deps.db)
+  await refreshAdminConfig(deps, now)
+  await syncConfig(deps, now)
+
+  const claim = await deps.db.run(
+    `INSERT INTO tick_results (tick_at, results_json) VALUES (?, '[]') ON CONFLICT (tick_at) DO NOTHING`,
+    [tickAt],
+  )
+  if (claim.changes === 0) {
+    summary.duplicate = true
+    return summary
+  }
+
+  const monitors = activeMonitors(deps.config, deps.role)
+  const states = await loadStates(deps.db)
+
+  // Push monitors: late / missed / hung.
+  for (const m of monitors) {
+    if (m.kind !== 'push') continue
+    const s = states.get(m.id)
+    if (!s) continue
+    const decision = evaluatePush(m, s, now, deps.config.timezone)
+    if (decision.kind === 'none') continue
+    const applied = await applyTransition(deps.db, {
+      monitorId: m.id,
+      fromVersion: s.version,
+      at: now,
+      ...(decision.kind === 'late'
+        ? { to: 'late' as const }
+        : {
+            to: 'down' as const,
+            reason: decision.reason,
+            detail: decision.detail,
+            maintenance: activeMaintenance(deps.config.maintenance, m.id, now).length > 0,
+          }),
+    })
+    if (applied) summary.transitions++
+  }
+
+  // Active HTTP and TCP checks.
+  const due = monitors.filter(
+    (m): m is HttpMonitor | TcpMonitor => m.kind !== 'push' && states.get(m.id)?.status !== 'paused' && isDue(m, tickAt / 60),
+  )
+  const overCap = due.splice(deps.config.limits.maxChecksPerTick)
+  const { results, skipped } = await runPool(due, HTTP_CONCURRENCY, startedMs + deps.config.limits.tickBudgetMs, (m) => {
+    if (m.kind === 'http') return runHttpCheck(m, deps.fetch)
+    if (!deps.tcpConnect) return Promise.resolve({ id: m.id, ok: false, ms: null, code: null, err: 'TCP checks are unavailable in this runtime' })
+    return runTcpCheck(m, deps.tcpConnect)
+  })
+  summary.checks = results.length
+  summary.skippedChecks = [...overCap, ...skipped].map((m) => m.id)
+  if (summary.skippedChecks.length) {
+    deps.log('warn', 'checks skipped this tick (cap or time budget)', { monitors: summary.skippedChecks })
+  }
+  const byId = new Map(due.map((m) => [m.id, m]))
+  let confirmationsRemaining = deps.config.limits.maxConfirmationsPerTick
+  for (const r of results) {
+    const m = byId.get(r.id)!
+    const s = states.get(r.id)
+    if (!s) continue
+    // Retries remain local and free. Confirmation is only paid for once a failure
+    // would otherwise transition this monitor to down.
+    if (!r.ok && s.status !== 'down' && m.confirm && s.consecutive_fail + 1 > m.retries) {
+      const regions = Math.min(m.confirm.regions, Math.max(0, confirmationsRemaining))
+      confirmationsRemaining -= regions
+      const outcome = await confirmFailure(
+        deps.db,
+        regions > 0 ? deps.confirmationProbe : undefined,
+        m,
+        tickAt,
+        deps.location ?? 'scheduler',
+        r.err,
+        regions,
+        m.confirm.quorum,
+      )
+      const confirmedResult = { ...r, err: `${r.err ?? 'check failed'} — ${outcome.detail}` }
+      // An unconfirmed result may update the retry bookkeeping and audit table,
+      // but it cannot open an incident or mutate the monitor's visible status.
+      if (await applyCheckResult(deps, m, s, confirmedResult, now, outcome.confirmed)) summary.transitions++
+      continue
+    }
+    if (await applyCheckResult(deps, m, s, r, now)) summary.transitions++
+  }
+  if (results.length) {
+    await deps.db.run(`UPDATE tick_results SET results_json = ? WHERE tick_at = ?`, [JSON.stringify(results), tickAt])
+  }
+
+  await rollupLatency(
+    deps.db,
+    monitors.filter((m): m is HttpMonitor => m.kind === 'http'),
+    now,
+  )
+
+  await runExpiryChecks(deps, now)
+
+  await pingPeer(deps)
+  summary.notifications = await dispatchNotifications(deps, now)
+  await enqueueIncidentSubscribers(deps, now)
+  await dispatchSubscriberOutbox(deps, now)
+  await maybeRunRetention(deps, now)
+  return summary
+}
