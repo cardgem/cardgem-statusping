@@ -1,6 +1,6 @@
 {
   "name": "cardgem-statusping",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "statusping": {
     "minimumUpgradeVersion": "0.1.0"
   },
