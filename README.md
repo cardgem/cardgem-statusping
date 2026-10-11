@@ -68,6 +68,21 @@ it through a pull request; Cloudflare deploys the merge, and `/healthz` then
 reports the new version. To roll back the code, revert that pull request;
 database migrations are forward-only and are never rolled back.
 
+If your Cloudflare project builds non-production branches, its preview build
+for the upgrade branch fails unless `wrangler.toml` has a `[previews]` block.
+That does not affect the production deploy after you merge; turn off builds for
+non-production branches under **Settings → Build** if you do not use previews.
+
+Repositories created before `statusping.release.json` existed have no
+`npm run upgrade` yet. Run the command from a copy of the latest template
+instead; `--adopt` finds the template commit your repository was created from
+and uses it as the starting point:
+
+```sh
+git clone --depth 1 https://github.com/getstatusping/statusping.git /tmp/statusping-latest
+node /tmp/statusping-latest/scripts/upgrade.ts --adopt
+```
+
 If you edited an updater-owned file, the command lists it and stops. Restore
 the file, or rerun with `--skip-conflicts` to upgrade everything else and merge
 that file by hand. Upstream changes to your own files (`statusping.config.ts`,
@@ -120,6 +135,29 @@ To enable the browser admin, include `admin: true` in the initial configuration 
 Every YAML import is parsed as safe plain data, validated by the same StatusPing configuration schema used by code-based configuration, and checked for admin safety rules before it is saved. Invalid files leave the active configuration unchanged. Secrets stay in Cloudflare/Node environment variables: YAML may reference them with `$env: SECRET_NAME`, but never contains their values.
 
 When browser admin is enabled, the validated D1-backed configuration becomes the running configuration. The checked-in configuration or `STATUSPING_CONFIG` remains the initial seed and is still the recommended approach for automated or version-controlled deployments.
+
+## Setup wizard and reset
+
+An instance can be returned to a guided setup wizard, which replaces its configuration with one
+you create in the browser:
+
+1. Add a secret named `STATUSPING_RESET_TOKEN` with a long random value (Cloudflare: Workers &
+   Pages → *your Worker* → Settings → **Variables and Secrets**, or `npx wrangler secret put
+   STATUSPING_RESET_TOKEN`; Node: add it to `.env` and restart).
+2. Open `/setup/reset`, enter the token, and type `reset`. The site switches to setup mode:
+   every page shows "being set up", `/healthz` reports `"setup": "required"`, and no checks run.
+   Everyone is signed out. The previous configuration and all monitor history are kept.
+3. Open `/setup` and enter the **setup code**. StatusPing writes it to the logs every minute
+   while setup is pending (Cloudflare: the Worker's **Logs**, or `npx wrangler tail`). To choose
+   your own code instead, set the `STATUSPING_SETUP_TOKEN` secret.
+4. Choose a sign-in method, save the generated administrator password, describe the site, and
+   optionally add a first monitor. **Finish** saves the configuration and signs you in to
+   `/admin`; checks start on the next minute.
+5. Remove the `STATUSPING_RESET_TOKEN` secret. Without it, `/setup/reset` does not exist.
+
+After setup, the configuration lives in the database and is edited as YAML in `/admin`;
+`statusping.config.ts` is no longer used. The wizard currently sets up the built-in email +
+password sign-in; Cloudflare Access or OIDC can then be configured in the YAML.
 
 ## Run on Node and use an independent confirmation peer
 
