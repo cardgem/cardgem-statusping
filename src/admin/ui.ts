@@ -9,13 +9,14 @@ import type { AuditEntry } from './service.ts'
 import type { MonitorRow, SinkType } from './forms.ts'
 import { SINK_FIELDS } from './forms.ts'
 import type { StoredUpdateCheck } from '../updates.ts'
+import { type ApiToken, MCP_SCOPES, type McpScope } from '../mcp/tokens.ts'
 import { releaseNotesUrl } from '../updates.ts'
 import { STYLES } from '../web/styles.ts'
 import { timezoneSelect } from '../util/timezones.ts'
 
 const escape = (value: string) => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 
-export type Section = 'general' | 'monitors' | 'pages' | 'channels' | 'access' | 'import' | 'export' | 'activity'
+export type Section = 'general' | 'monitors' | 'pages' | 'channels' | 'access' | 'mcp' | 'configuration' | 'activity'
 export type UpdateState = StoredUpdateCheck | { result: 'disabled'; targetVersion: null; checkedAt: null }
 /** Where a credential comes from: a Worker secret, the database, or nowhere. */
 export type SecretSource = 'env' | 'db' | false
@@ -29,8 +30,8 @@ const SECTIONS: Array<[Section, string, string]> = [
   ['pages', 'Status pages', '/admin/pages'],
   ['channels', 'Alert channels', '/admin/channels'],
   ['access', 'Access', '/admin/access'],
-  ['import', 'Import', '/admin/import'],
-  ['export', 'Export', '/admin/export'],
+  ['mcp', 'MCP', '/admin/mcp'],
+  ['configuration', 'Configuration', '/admin/configuration'],
   ['activity', 'Activity', '/admin/activity'],
 ]
 
@@ -136,11 +137,13 @@ export function generalPage(opts: { viewer: Viewer; csrf: string; title: string;
 ${field('Site title', textInput('title', opts.title, 'maxlength="80" required'))}
 ${field('Address', textInput('baseUrl', opts.baseUrl, 'type="url" required'), 'The public address of this site, used in alert links, ping URLs and sign-in callbacks.')}
 ${field('Timezone', timezoneSelect('timezone', opts.timezone, 'required'), 'Used for times on your status pages and for scheduled jobs.')}
-<label class="check"><input type="checkbox" name="updates" value="1"${opts.updatesEnabled ? ' checked' : ''}><span>Check for StatusPing updates (contacts GitHub at most once a day)</span></label>
 <div class="actions"><button class="btn-primary" type="submit">Save</button></div></form></section>
-<section class="card"><h2>Software</h2><p class="lead">Installed version <code>v${escape(opts.installedVersion)}</code>. ${status}</p>
+<section class="card"><h2>Software updates</h2><p class="lead">Installed version <code>v${escape(opts.installedVersion)}</code>. ${status}</p>
 ${actions ? `<div class="actions">${actions}</div>` : ''}
-<p class="hint" style="margin:12px 0 0">${available ? 'Update opens statusp.ing, where you sign in with GitHub and update directly or through a pull request. Your site\'s address stays in your browser.' : ''}${checked}</p></section>
+<p class="hint" style="margin:12px 0 0">${available ? 'Update opens statusp.ing, where you sign in with GitHub and update directly or through a pull request. Your site\'s address stays in your browser.' : ''}${checked}</p>
+<form method="post" action="/admin/updates" style="margin-top:16px">${hidden(opts.csrf)}
+<label class="check"><input type="checkbox" name="updates" value="1"${opts.updatesEnabled ? ' checked' : ''} onchange="this.form.requestSubmit()"><span>Check for StatusPing updates (contacts GitHub at most once a day)</span></label>
+<noscript><div class="actions"><button class="btn-outline" type="submit">Save</button></div></noscript></form></section>
 ${resetCard(opts.csrf, opts.resetError)}` })
 }
 
@@ -215,15 +218,18 @@ export function pingUrlPage(opts: { viewer: Viewer; monitorName: string; monitor
 
 // ── Status pages ────────────────────────────────────────────────────────────────────────────
 
-export function pagesPage(opts: { viewer: Viewer; pages: PageInput[]; home: string | undefined; notice?: string; error?: string }): string {
-  const rows = opts.pages.map((p) => `<tr><td><a href="/admin/pages/${encodeURIComponent(p.slug)}"><strong>${escape(p.title)}</strong></a><span class="sub">/${escape(p.slug)}${p.slug === opts.home ? ' · home page' : ''}</span></td>
+export function pagesPage(opts: { viewer: Viewer; csrf: string; pages: PageInput[]; home: string | undefined; notice?: string; error?: string }): string {
+  // With several pages, one of them is what visitors see at the site's root address.
+  const makeHome = (slug: string) => opts.pages.length > 1 && slug !== opts.home
+    ? `<form method="post" action="/admin/pages/${encodeURIComponent(slug)}/home" style="display:inline">${hidden(opts.csrf)}<button class="btn-outline" type="submit">Make home page</button></form> ` : ''
+  const rows = opts.pages.map((p) => `<tr><td><a href="/admin/pages/${encodeURIComponent(p.slug)}"><strong>${escape(p.title)}</strong></a><span class="sub">/${escape(p.slug)}${opts.pages.length > 1 && p.slug === opts.home ? ' · home page (/)' : ''}</span></td>
 <td><span class="badge">${p.access === undefined || p.access === 'public' ? 'Public' : 'Private'}</span></td><td>${p.monitors.includes('*') ? 'All monitors' : `${p.monitors.length} monitor${p.monitors.length === 1 ? '' : 's'}`}</td>
-<td class="end"><a class="btn-outline" href="/${encodeURIComponent(p.slug)}">View</a> <a class="btn-outline" href="/admin/pages/${encodeURIComponent(p.slug)}">Edit</a></td></tr>`).join('')
+<td class="end">${makeHome(p.slug)}<a class="btn-outline" href="/${encodeURIComponent(p.slug)}">View</a> <a class="btn-outline" href="/admin/pages/${encodeURIComponent(p.slug)}">Edit</a></td></tr>`).join('')
   return layout({ ...opts, section: 'pages', title: 'Status pages', description: 'Who sees which monitors.', actions: '<a class="btn-primary" href="/admin/pages/new">Add page</a>', body: `
 <section class="card"><table class="table"><thead><tr><th>Page</th><th>Visibility</th><th>Shows</th><th></th></tr></thead><tbody>${rows}</tbody></table></section>` })
 }
 
-export function pageForm(opts: { viewer: Viewer; csrf: string; page?: PageInput; isHome: boolean; monitors: Array<{ id: string; name: string }>; values?: Record<string, string>; error?: string }): string {
+export function pageForm(opts: { viewer: Viewer; csrf: string; page?: PageInput; monitors: Array<{ id: string; name: string }>; values?: Record<string, string>; error?: string }): string {
   const p = opts.page
   const editing = Boolean(p)
   const isPublic = opts.values?.visibility ? opts.values.visibility === 'public' : p?.access === undefined || p.access === 'public'
@@ -244,7 +250,6 @@ ${field('People who can see a private page', `<textarea class="input" id="emails
 <label class="check"><input type="radio" name="show" value="all"${all ? ' checked' : ''}><span>All monitors</span></label>
 <label class="check"><input type="radio" name="show" value="some"${all ? '' : ' checked'}><span>Only these:</span></label>
 ${opts.monitors.map((m) => `<label class="check" style="margin-left:24px"><input type="checkbox" name="monitors" value="${escape(m.id)}"${!all && p?.monitors.includes(m.id) ? ' checked' : ''}><span>${escape(m.name)}</span></label>`).join('') || '<p class="hint" style="margin:0 0 0 24px">No monitors yet.</p>'}</div></div>
-<label class="check"><input type="checkbox" name="home" value="1"${opts.isHome ? ' checked' : ''}><span>Show this page at the site's home address (/)</span></label>
 <div class="actions"><button class="btn-primary" type="submit">${editing ? 'Save page' : 'Add page'}</button><a class="btn-outline" href="/admin/pages">Cancel</a></div></form></section>
 ${editing ? `<section class="card danger"><h2>Delete page</h2><p class="lead">Monitors and their history are not affected.</p><form method="post" action="/admin/pages/${encodeURIComponent(p!.slug)}/delete">${hidden(opts.csrf)}<button class="btn-danger" type="submit">Delete ${escape(p!.title)}</button></form></section>` : ''}` })
 }
@@ -298,28 +303,61 @@ ${field('Administrator emails', `<textarea class="input" id="admins" name="admin
 <div class="actions"><button class="btn-primary" type="submit">Save administrators</button></div></form></section>` })
 }
 
+// ── MCP ─────────────────────────────────────────────────────────────────────────────────────
+
+const when = (seconds: number | null) => (seconds === null ? 'Never' : new Date(seconds * 1000).toISOString().replace('T', ' ').slice(0, 16) + ' UTC')
+
+export function mcpPage(opts: { viewer: Viewer; csrf: string; baseUrl: string; tokens: ApiToken[]; values?: Record<string, string | string[]>; notice?: string; error?: string }): string {
+  const endpoint = `${opts.baseUrl.replace(/\/+$/, '')}/mcp`
+  const chosen = new Set([opts.values?.scopes ?? 'read'].flat())
+  const rows = opts.tokens.map((t) => `<tr><td><strong>${escape(t.name)}</strong><span class="sub">Created by ${escape(t.createdBy)}, ${when(t.createdAt)}</span></td>
+<td>${t.scopes.map((s) => `<span class="badge">${escape(MCP_SCOPES[s].label)}</span>`).join(' ')}</td><td class="small">${when(t.lastUsedAt)}</td>
+<td class="end"><form method="post" action="/admin/mcp/${t.id}/revoke" style="display:inline">${hidden(opts.csrf)}<button class="btn-outline" type="submit">Revoke</button></form></td></tr>`).join('')
+  return layout({ ...opts, section: 'mcp', title: 'MCP', description: 'Let AI assistants such as Claude read your status and, if you allow it, post incidents or manage monitors.', body: `
+<section class="card"><h2>Server address</h2><p class="lead">Add this to an MCP client, with a token below as a bearer token.</p><pre>${escape(endpoint)}</pre></section>
+${rows ? `<section class="card"><table class="table"><thead><tr><th>Token</th><th>Can</th><th>Last used</th><th></th></tr></thead><tbody>${rows}</tbody></table></section>` : ''}
+<section class="card"><h2>Create a token</h2><p class="lead">Give each assistant or person its own token, so you can revoke it on its own.</p>
+<form class="form" method="post" action="/admin/mcp">${hidden(opts.csrf)}
+${field('Name', textInput('name', [opts.values?.name ?? ''].flat()[0], 'maxlength="60" placeholder="for example Claude on my laptop" required'))}
+<div class="field"><span class="legend">What it can do</span><div class="choices">
+${(Object.keys(MCP_SCOPES) as McpScope[]).map((s) => `<label class="check"><input type="checkbox" name="scopes" value="${s}"${chosen.has(s) ? ' checked' : ''}><span><strong>${escape(MCP_SCOPES[s].label)}</strong>. ${escape(MCP_SCOPES[s].help)}</span></label>`).join('')}
+</div></div>
+<div class="actions"><button class="btn-primary" type="submit">Create token</button></div></form></section>` })
+}
+
+export function mcpTokenCreated(opts: { viewer: Viewer; baseUrl: string; name: string; token: string; scopes: McpScope[] }): string {
+  const endpoint = `${opts.baseUrl.replace(/\/+$/, '')}/mcp`
+  const cli = `claude mcp add --transport http statusping ${endpoint} --header "Authorization: Bearer ${opts.token}"`
+  const json = JSON.stringify({ mcpServers: { statusping: { type: 'http', url: endpoint, headers: { Authorization: `Bearer ${opts.token}` } } } }, null, 2)
+  return layout({ ...opts, section: 'mcp', title: 'Token created', description: `${opts.name}: ${opts.scopes.map((s) => MCP_SCOPES[s].label.toLowerCase()).join(', ')}.`, body: `
+<section class="card"><p class="alert warning">Copy the token now. It is not shown again; if you lose it, revoke it and create another.</p>
+${field('Token', `<input class="input code" readonly value="${escape(opts.token)}" onclick="this.select()">`)}
+<h2 style="margin-top:24px">Claude Code</h2><pre>${escape(cli)}</pre>
+<h2 style="margin-top:24px">Other MCP clients</h2><p class="lead">For clients configured with JSON, such as an <code>.mcp.json</code> file:</p><pre>${escape(json)}</pre>
+<div class="actions"><a class="btn-primary" href="/admin/mcp">Done</a></div></section>` })
+}
+
 // ── Import / export / activity ──────────────────────────────────────────────────────────────
 
-export function importPage(opts: { viewer: Viewer; csrf: string; yaml?: string; error?: string }): string {
-  return layout({ ...opts, section: 'import', title: 'Import', description: 'Replace the whole configuration with a YAML file, for example one exported from another StatusPing site.', body: `
-<section class="card"><form class="form" method="post" action="/admin/import">${hidden(opts.csrf)}
+export function configurationPage(opts: { viewer: Viewer; csrf: string; yaml: string; importYaml?: string; error?: string; notice?: string }): string {
+  return layout({ ...opts, section: 'configuration', title: 'Configuration', description: 'Back up the whole configuration as YAML, or replace it with one, for example from another StatusPing site.', body: `
+<section class="card"><h2>Export</h2><p class="lead">Secrets are not included: credentials saved in this site stay here, and the file only names them.</p>
+<div class="actions"><a class="btn-primary" href="/admin/export/statusping.yaml">Download YAML</a></div>
+<details style="margin-top:16px"><summary class="small">Show the configuration</summary><pre>${escape(opts.yaml)}</pre></details></section>
+<section class="card" id="import"><h2>Import</h2><p class="lead">Replaces the whole configuration. Nothing changes until you confirm the preview.</p>
+${opts.error ? `<p class="form-error" role="alert">${escape(opts.error)}</p>` : ''}
+<form class="form" method="post" action="/admin/import">${hidden(opts.csrf)}
 ${field('YAML file', '<input class="input" id="import-file" type="file" accept=".yaml,.yml,text/yaml,application/yaml">', 'Or paste it below.')}
-${field('Configuration', `<textarea class="input code" id="config" name="config" spellcheck="false" required>${escape(opts.yaml ?? '')}</textarea>`)}
-<div class="actions"><button class="btn-primary" type="submit">Preview changes</button></div></form>
-<p class="hint" style="margin:16px 0 0">Nothing changes until you confirm the preview. Secrets are never part of a configuration file: it names Worker secrets with <code>$env</code>.</p></section>
+${field('Configuration', `<textarea class="input code" id="config" name="config" spellcheck="false" required>${escape(opts.importYaml ?? '')}</textarea>`, 'Secrets are never part of a configuration file: it names Worker secrets with <code>$env</code>.')}
+<div class="actions"><button class="btn-primary" type="submit">Preview changes</button></div></form></section>
 <script>document.getElementById('import-file').addEventListener('change',function(){var f=this.files&&this.files[0];if(!f)return;if(f.size>262144){alert('Configuration files must be 256 KB or smaller.');this.value='';return}var r=new FileReader();r.onload=function(){document.getElementById('config').value=String(r.result||'')};r.readAsText(f)})</script>` })
 }
 
 export function importPreview(opts: { viewer: Viewer; csrf: string; yaml: string; changes: string[] }): string {
-  return layout({ ...opts, section: 'import', title: 'Confirm import', description: 'The file is valid. This is what will change:', body: `
+  return layout({ ...opts, section: 'configuration', title: 'Confirm import', description: 'The file is valid. This is what will change:', body: `
 <section class="card"><ul class="changes">${opts.changes.map((c) => `<li>${escape(c)}</li>`).join('')}</ul>
 <form method="post" action="/admin/import/apply">${hidden(opts.csrf)}<input type="hidden" name="config" value="${escape(opts.yaml)}">
-<div class="actions"><button class="btn-primary" type="submit">Apply import</button><a class="btn-outline" href="/admin/import">Cancel</a></div></form></section>` })
-}
-
-export function exportPage(opts: { viewer: Viewer; yaml: string }): string {
-  return layout({ ...opts, section: 'export', title: 'Export', description: 'Download the whole configuration as YAML, for a backup or to move to another site.', actions: '<a class="btn-primary" href="/admin/export/statusping.yaml">Download YAML</a>', body: `
-<section class="card"><p class="lead">Secrets are not included: credentials saved in this site stay here, and the file only names them.</p><pre>${escape(opts.yaml)}</pre></section>` })
+<div class="actions"><button class="btn-primary" type="submit">Apply import</button><a class="btn-outline" href="/admin/configuration">Cancel</a></div></form></section>` })
 }
 
 export function activityPage(opts: { viewer: Viewer; audit: AuditEntry[] }): string {
@@ -333,7 +371,7 @@ function resetCard(csrf: string, error?: string): string {
 <p class="lead">Start over with the setup wizard, where you choose the sign-in method and settings again.</p>
 <ul class="changes"><li>Everyone is signed out, and built-in accounts are removed.</li><li>Checks stop and every page sends visitors to setup until it is finished.</li>
 <li>The current configuration and all monitor history are kept. The reset is recorded in Activity.</li></ul>
-<p class="hint" style="margin:0 0 16px">Tip: <a href="/admin/export">export the configuration</a> first, then import it after setup to keep your monitors, pages and alert channels.</p>
+<p class="hint" style="margin:0 0 16px">Tip: <a href="/admin/configuration">export the configuration</a> first, then import it after setup to keep your monitors, pages and alert channels.</p>
 ${error ? `<p class="form-error" role="alert">${escape(error)}</p>` : ''}
 <form class="form" method="post" action="/admin/reset">${hidden(csrf)}
 ${field('Type <code>reset</code> to confirm', textInput('confirm', '', 'autocomplete="off" required'))}
