@@ -3,6 +3,7 @@
  * theme as the status pages (Card, Button, Input, Alert) and work without JavaScript.
  */
 import { STYLES } from '../web/styles.ts'
+import { timezoneSelect } from '../util/timezones.ts'
 import { ACCESS_DOCS_URL, OIDC_PRESETS, presetById } from './instructions.ts'
 
 const escape = (value: string) => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
@@ -50,7 +51,8 @@ export const SETUP_STYLES = `
 .setup-card .hint + .howto { margin-top: 8px; }
 .setup-card .setup-form .actions, .connect-step .setup-form .actions { margin-top: 0; }
 .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 8px; }
-.actions a { color: var(--muted-foreground); font-size: 14px; }
+/* Plain text links in a button row are muted; links styled as buttons keep the button look. */
+.actions a:not(.btn-primary):not(.btn-outline) { color: var(--muted-foreground); font-size: 14px; }
 .alert { margin: 0 0 16px; padding: 10px 12px; border: 1px solid var(--border); border-radius: calc(var(--radius) - 2px); font-size: 14px; }
 .alert.warning { border-color: color-mix(in oklab, var(--warning) 55%, var(--border)); background: color-mix(in oklab, var(--warning) 8%, var(--card)); }
 .choices { display: grid; gap: 12px; }
@@ -253,11 +255,11 @@ export function basicsPage(opts: { csrf: string; completed: ReadonlySet<SetupSte
 ${field('Title', `<input class="input" id="title" name="title" type="text" value="${escape(opts.title)}" maxlength="80" required>`)}
 ${field('Base URL', `<input class="input" id="baseUrl" name="baseUrl" type="url" value="${escape(opts.baseUrl)}" required>`, 'Used in alert links, ping URLs and sign-in callbacks.')}
 ${workersDev ? '<p class="alert warning">This is a <code>workers.dev</code> address. If you add a custom domain later, update the base URL in the YAML admin.</p>' : ''}
-${field('Timezone', `<input class="input" id="timezone" name="timezone" type="text" value="${escape(opts.timezone)}" required>`, 'An IANA name such as <code>Europe/London</code> or <code>America/Los_Angeles</code>.')}
+${field('Timezone', timezoneSelect('timezone', opts.timezone, 'required'), 'Used for times on your status pages and for scheduled jobs.')}
 <label class="check"><input type="checkbox" name="privatePage" value="1"${opts.privatePage ? ' checked' : ''}><span>Make the status page private (only administrators can see it)</span></label>
 <label class="check"><input type="checkbox" name="updates" value="1"${opts.updates ? ' checked' : ''}><span>Check for StatusPing updates (contacts GitHub at most once a day; shown only in the admin)</span></label>
 <div class="actions"><button class="btn-primary" type="submit">Continue</button></div></form>
-<script>(()=>{const t=document.getElementById('timezone');if(t&&t.value==='UTC'){try{t.value=Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC'}catch{}}})()</script>`)
+<script>(()=>{const t=document.getElementById('timezone');if(t&&t.value==='UTC'){try{const z=Intl.DateTimeFormat().resolvedOptions().timeZone;if(z&&[...t.options].some(o=>o.value===z))t.value=z}catch{}}})()</script>`)
 }
 
 export type MonitorKind = 'http' | 'push' | 'tcp'
@@ -310,7 +312,7 @@ export function setupDonePage(opts: { pingUrl: string; monitorName: string }): s
 <p class="secret">${escape(opts.pingUrl)}</p>
 <p>For example, at the end of the job:</p><pre>curl -fsS ${escape(opts.pingUrl)}</pre>
 <p class="hint">To report a failure instead, call <code>${escape(opts.pingUrl)}/fail</code>; to track run time, call <code>${escape(opts.pingUrl)}/start</code> when the job begins.</p>
-<div class="actions"><a class="btn-primary" href="/admin">Go to the admin</a></div>`)
+<div class="actions"><a class="btn-primary" href="/admin">Open Settings</a></div>`)
 }
 
 export function resetPage(opts: { error?: string }): string {

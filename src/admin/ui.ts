@@ -11,6 +11,7 @@ import { SINK_FIELDS } from './forms.ts'
 import type { StoredUpdateCheck } from '../updates.ts'
 import { releaseNotesUrl } from '../updates.ts'
 import { STYLES } from '../web/styles.ts'
+import { timezoneSelect } from '../util/timezones.ts'
 
 const escape = (value: string) => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 
@@ -68,7 +69,7 @@ textarea.code { min-height: 24rem; font: 13px/1.5 ui-monospace, SFMono-Regular, 
 .table { width: 100%; border-collapse: collapse; font-size: 14px; }
 .table th { padding: 0 12px 8px 0; text-align: left; font-weight: 500; color: var(--muted-foreground); border-bottom: 1px solid var(--border); }
 .table td { padding: 10px 12px 10px 0; border-bottom: 1px solid var(--border); vertical-align: middle; }
-.table tr:last-child td { border-bottom: 0; } .table td.end { text-align: right; white-space: nowrap; padding-right: 0; }
+.table tr:last-child td { border-bottom: 0; } .table tbody tr:hover { background: transparent; } .table td.end { text-align: right; white-space: nowrap; padding-right: 0; }
 .table .sub { display: block; color: var(--muted-foreground); font-size: 13px; overflow-wrap: anywhere; }
 .badge { display: inline-flex; align-items: center; height: 22px; padding: 0 8px; border: 1px solid var(--border); border-radius: 999px; font-size: 12px; font-weight: 500; white-space: nowrap; }
 .empty { padding: 24px; text-align: center; color: var(--muted-foreground); }
@@ -114,26 +115,33 @@ ${notice(opts.notice)}${notice(opts.error, 'error')}${opts.body}</div></div></ma
 
 // ── General ─────────────────────────────────────────────────────────────────────────────────
 
-export function generalPage(opts: { viewer: Viewer; csrf: string; title: string; baseUrl: string; timezone: string; updatesEnabled: boolean; installedVersion: string; update: UpdateState; notice?: string; error?: string }): string {
+export function generalPage(opts: { viewer: Viewer; csrf: string; title: string; baseUrl: string; timezone: string; updatesEnabled: boolean; installedVersion: string; update: UpdateState; notice?: string; error?: string; resetError?: string }): string {
   const u = opts.update
-  const updateLine = u.result === 'disabled' ? 'Update checks are off.'
-    : u.result === 'available' && u.targetVersion ? `Version <strong>v${escape(u.targetVersion)}</strong> is available. <a href="${escape(releaseNotesUrl(u.targetVersion))}">Release notes</a>
-<div class="actions" style="margin-top:12px"><a class="btn-primary" href="${escape(updateUrl(u.targetVersion, opts.baseUrl))}">Update to v${escape(u.targetVersion)}</a></div>
-<p class="hint" style="margin:8px 0 0">Opens statusp.ing, where you sign in with GitHub and choose to update directly or through a pull request. Your site's address stays in your browser.</p>`
+  const available = u.result === 'available' && u.targetVersion ? u.targetVersion : null
+  const status = u.result === 'disabled' ? 'Update checks are off.'
+    : available ? `Version <strong>v${escape(available)}</strong> is available.`
       : u.result === 'incompatible' && u.targetVersion ? `Version v${escape(u.targetVersion)} is available but needs a manual upgrade path for this installation.`
         : u.result === 'failed' ? 'The signed update manifest could not be checked. No update is being offered.'
           : 'This installation is up to date.'
-  const checked = u.checkedAt === null ? '' : `<p class="hint" style="margin:8px 0 0">Last checked ${escape(new Date(u.checkedAt * 1000).toISOString().replace('T', ' ').slice(0, 16))} UTC.</p>`
+  const checked = u.checkedAt === null ? '' : ` Last checked ${escape(new Date(u.checkedAt * 1000).toISOString().replace('T', ' ').slice(0, 16))} UTC.`
+  // Every update action in one row: update, re-check, and the release notes.
+  const actions = [
+    available ? `<a class="btn-primary" href="${escape(updateUrl(available, opts.baseUrl))}">Update to v${escape(available)}</a>` : '',
+    u.result === 'disabled' ? '' : `<form method="post" action="/admin/updates/check" style="display:contents">${hidden(opts.csrf)}<button class="btn-outline" type="submit">Check for updates</button></form>`,
+    available ? `<a class="btn-outline" href="${escape(releaseNotesUrl(available))}">Release notes</a>` : '',
+  ].filter(Boolean).join('')
   return layout({ ...opts, section: 'general', title: 'General', description: 'Your status site and its software.', body: `
 <section class="card"><h2>Site</h2><p class="lead">Shown on your status pages and used in alert links.</p>
 <form class="form" method="post" action="/admin/general">${hidden(opts.csrf)}
 ${field('Site title', textInput('title', opts.title, 'maxlength="80" required'))}
 ${field('Address', textInput('baseUrl', opts.baseUrl, 'type="url" required'), 'The public address of this site, used in alert links, ping URLs and sign-in callbacks.')}
-${field('Timezone', textInput('timezone', opts.timezone, 'required'), 'An IANA name such as <code>Europe/London</code>.')}
+${field('Timezone', timezoneSelect('timezone', opts.timezone, 'required'), 'Used for times on your status pages and for scheduled jobs.')}
 <label class="check"><input type="checkbox" name="updates" value="1"${opts.updatesEnabled ? ' checked' : ''}><span>Check for StatusPing updates (contacts GitHub at most once a day)</span></label>
 <div class="actions"><button class="btn-primary" type="submit">Save</button></div></form></section>
-<section class="card"><h2>Software</h2><p class="lead">Installed version <code>v${escape(opts.installedVersion)}</code>.</p><p style="margin:0">${updateLine}</p>${checked}
-${u.result === 'disabled' ? '' : `<form method="post" action="/admin/updates/check" style="margin-top:12px">${hidden(opts.csrf)}<button class="btn-outline" type="submit">Check for updates</button></form>`}</section>` })
+<section class="card"><h2>Software</h2><p class="lead">Installed version <code>v${escape(opts.installedVersion)}</code>. ${status}</p>
+${actions ? `<div class="actions">${actions}</div>` : ''}
+<p class="hint" style="margin:12px 0 0">${available ? 'Update opens statusp.ing, where you sign in with GitHub and update directly or through a pull request. Your site\'s address stays in your browser.' : ''}${checked}</p></section>
+${resetCard(opts.csrf, opts.resetError)}` })
 }
 
 // ── Monitors ────────────────────────────────────────────────────────────────────────────────
@@ -171,7 +179,7 @@ ${field('Failed checks before alerting', textInput('retries', v('retries'), 'typ
     : opts.kind === 'push' ? `
 ${field('How often does it run?', selectInput('period', PERIODS, v('period', '1d')))}
 ${field('Or a cron schedule', textInput('schedule', v('schedule'), 'placeholder="0 3 * * *" spellcheck="false"'), 'Optional. Use this when the job runs at fixed times; it replaces the interval above.')}
-<div class="grid-2">${field('Schedule timezone', textInput('tz', v('tz', opts.timezone)))}${field('Grace period', textInput('grace', v('grace'), 'placeholder="e.g. 15m"'), 'Extra time before a late job alerts.')}</div>
+<div class="grid-2">${field('Schedule timezone', timezoneSelect('tz', v('tz', opts.timezone)))}${field('Grace period', textInput('grace', v('grace'), 'placeholder="e.g. 15m"'), 'Extra time before a late job alerts.')}</div>
 ${field('Maximum run time', textInput('maxRuntime', v('maxRuntime'), 'placeholder="e.g. 2h"'), 'Optional. Alerts when a started job has not finished in time.')}`
       : `
 <p class="hint" style="margin:0">On Cloudflare, port checks cannot reach Cloudflare-proxied hostnames, port 25, or private addresses. Use the server's public IP or an unproxied hostname.</p>
@@ -317,4 +325,17 @@ export function exportPage(opts: { viewer: Viewer; yaml: string }): string {
 export function activityPage(opts: { viewer: Viewer; audit: AuditEntry[] }): string {
   const items = opts.audit.map((e) => `<li><time datetime="${new Date(e.at * 1000).toISOString()}">${new Date(e.at * 1000).toISOString().replace('T', ' ').slice(0, 16)} UTC</time><span><strong>${escape(e.actor)}</strong> ${escape(e.action)} <span class="muted">${escape(e.target)}</span></span></li>`).join('')
   return layout({ ...opts, section: 'activity', title: 'Activity', description: 'Recent changes to this site. Secret values are never recorded.', body: `<section class="card">${items ? `<ul class="audit">${items}</ul>` : '<p class="empty">No changes recorded yet.</p>'}</section>` })
+}
+
+/** The danger-zone card at the end of General: return the site to the setup wizard. */
+function resetCard(csrf: string, error?: string): string {
+  return `<section class="card danger" id="reset"><h2>Reset to the setup wizard</h2>
+<p class="lead">Start over with the setup wizard, where you choose the sign-in method and settings again.</p>
+<ul class="changes"><li>Everyone is signed out, and built-in accounts are removed.</li><li>Checks stop and every page sends visitors to setup until it is finished.</li>
+<li>The current configuration and all monitor history are kept. The reset is recorded in Activity.</li></ul>
+<p class="hint" style="margin:0 0 16px">Tip: <a href="/admin/export">export the configuration</a> first, then import it after setup to keep your monitors, pages and alert channels.</p>
+${error ? `<p class="form-error" role="alert">${escape(error)}</p>` : ''}
+<form class="form" method="post" action="/admin/reset">${hidden(csrf)}
+${field('Type <code>reset</code> to confirm', textInput('confirm', '', 'autocomplete="off" required'))}
+<div class="actions"><button class="btn-danger" type="submit">Reset to setup</button></div></form></section>`
 }
