@@ -22,5 +22,5 @@ tag = "v1"
 new_sqlite_classes = ["RegionalProbe"]
 
 [vars]
-STATUSPING_TEMPLATE_VERSION = "0.2.13"
+STATUSPING_TEMPLATE_VERSION = "0.2.14"
 STATUSPING_ROLE = "primary"
