@@ -1,6 +1,6 @@
 {
   "name": "cardgem-statusping",
-  "version": "0.2.5",
+  "version": "0.2.7",
   "statusping": {
     "minimumUpgradeVersion": "0.1.0"
   },
@@ -13,7 +13,8 @@
   },
   "exports": {
     "./config": "./src/config.ts",
-    "./updates": "./src/updates.ts"
+    "./updates": "./src/updates.ts",
+    "./upgrade-plan": "./src/upgrade-plan.ts"
   },
   "scripts": {
     "test": "vitest run",
