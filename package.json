@@ -1,6 +1,9 @@
 {
   "name": "cardgem-statusping",
-  "version": "0.1.0",
+  "version": "0.1.1",
+  "statusping": {
+    "minimumUpgradeVersion": "0.1.0"
+  },
   "private": true,
   "description": "Serverless uptime and cron-job monitoring with a status page, for Cloudflare Workers or Node.",
   "type": "module",
@@ -9,7 +12,8 @@
     "node": ">=22.18"
   },
   "exports": {
-    "./config": "./src/config.ts"
+    "./config": "./src/config.ts",
+    "./updates": "./src/updates.ts"
   },
   "scripts": {
     "test": "vitest run",
@@ -21,14 +25,18 @@
     "cf:dev": "wrangler dev --config adapters/cloudflare/wrangler.toml --test-scheduled",
     "cf:deploy": "wrangler deploy --config adapters/cloudflare/wrangler.toml",
     "release:bundle": "node scripts/build-release-bundle.ts",
-    "template:generate": "node scripts/build-deploy-template.ts"
+    "release:verify": "node scripts/verify-release-bundle.ts",
+    "template:generate": "node scripts/build-deploy-template.ts",
+    "template:verify": "node scripts/verify-template-contract.ts",
+    "upgrade": "node --disable-warning=ExperimentalWarning scripts/upgrade.ts"
   },
   "dependencies": {
     "@statusping/ui": "file:packages/ui",
     "@hono/node-server": "^2.1.4",
     "@libsql/client": "^0.18.0",
     "croner": "^10.0.1",
-    "hono": "^4.13.13"
+    "hono": "^4.13.13",
+    "yaml": "^2.9.1"
   },
   "devDependencies": {
     "@types/node": "^26.6.4",

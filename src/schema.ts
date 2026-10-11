@@ -214,6 +214,30 @@ export const MIGRATIONS: string[][] = [
     )`,
     `CREATE INDEX IF NOT EXISTS ping_rate_limits_window ON ping_rate_limits(window_at)`,
   ],
+  [
+    `CREATE TABLE IF NOT EXISTS announcement_notifications (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      announcement_update_id INTEGER NOT NULL,
+      sink TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      sent_at INTEGER,
+      ok INTEGER NOT NULL DEFAULT 0,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      error TEXT,
+      UNIQUE (announcement_update_id, sink)
+    )`,
+    `CREATE INDEX IF NOT EXISTS announcement_notifications_pending ON announcement_notifications(ok, created_at)`,
+  ],
+  [
+    // The update checker intentionally retains no manifest body, URL, credentials, or error
+    // details—only its safe, compact outcome for the administrator UI.
+    `CREATE TABLE IF NOT EXISTS update_checks (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      result TEXT NOT NULL CHECK (result IN ('available', 'current', 'incompatible', 'failed')),
+      target_version TEXT,
+      checked_at INTEGER NOT NULL
+    )`,
+  ],
 ]
 
 export const SCHEMA_VERSION = MIGRATIONS.length
