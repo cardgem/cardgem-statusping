@@ -43,7 +43,12 @@ export const SETUP_STYLES = `
 .setup-form { display: grid; gap: 16px; }
 .setup-form .field { display: grid; gap: 8px; } .setup-form .field label { font-size: 14px; font-weight: 500; }
 .setup-form .input { width: 100%; }
-.hint { margin: -8px 0 0; font-size: 13px; font-weight: 400; color: var(--muted-foreground); }
+.reveal { display: flex; gap: 8px; } .reveal .input { flex: 1; min-width: 0; } .reveal-toggle { flex: none; min-width: 64px; }
+.hint, .setup-card .hint { margin: -8px 0 0; font-size: 13px; font-weight: 400; color: var(--muted-foreground); }
+.setup-card .setup-form > .hint { margin: -10px 0 0; }
+.setup-card form + .hint, .setup-card form + .howto { margin-top: 16px; }
+.setup-card .hint + .howto { margin-top: 8px; }
+.setup-card .setup-form .actions, .connect-step .setup-form .actions { margin-top: 0; }
 .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 8px; }
 .actions a { color: var(--muted-foreground); font-size: 14px; }
 .alert { margin: 0 0 16px; padding: 10px 12px; border: 1px solid var(--border); border-radius: calc(var(--radius) - 2px); font-size: 14px; }
@@ -71,8 +76,27 @@ export const SETUP_STYLES = `
 .howto { margin: 0 0 16px; font-size: 14px; } .howto summary { cursor: pointer; color: var(--muted-foreground); } .howto ul { margin: 8px 0; }
 .btn-primary[aria-disabled="true"] { opacity: .5; cursor: not-allowed; }
 select.input { width: 100%; }
+.segmented { display: inline-flex; gap: 4px; margin: 0 0 8px; padding: 4px; border-radius: var(--radius); background: var(--muted); }
+.segmented a { padding: 6px 12px; border-radius: calc(var(--radius) - 4px); font-size: 14px; color: var(--muted-foreground); }
+.segmented a:hover { color: var(--foreground); text-decoration: none; }
+.segmented a[aria-current="page"] { background: var(--background); color: var(--foreground); font-weight: 500; box-shadow: 0 1px 2px rgb(0 0 0 / .08); }
+.setup-card .kind-note { margin: 0 0 16px; }
+.summary { display: grid; grid-template-columns: max-content 1fr; gap: 10px 24px; margin: 0 0 20px; }
+.summary dt { color: var(--muted-foreground); } .summary dd { margin: 0; overflow-wrap: anywhere; }
+@media (max-width: 520px) { .summary { grid-template-columns: 1fr; gap: 2px; } .summary dd { margin-bottom: 8px; } }
 .secret { margin: 0 0 16px; padding: 12px 14px; border-radius: calc(var(--radius) - 2px); background: var(--muted); font: 600 16px ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; user-select: all; }
 `
+
+/**
+ * Adds a Show/Hide toggle to every password field, so a mistyped secret can be checked before
+ * saving. Without JavaScript the fields simply stay masked.
+ */
+const REVEAL_SCRIPT = `document.querySelectorAll('.setup-form input[type=password]').forEach(function(input){
+var wrap=document.createElement('div');wrap.className='reveal';input.parentNode.insertBefore(wrap,input);wrap.appendChild(input);
+var button=document.createElement('button');button.type='button';button.className='btn-outline reveal-toggle';button.textContent='Show';
+button.setAttribute('aria-controls',input.id);button.setAttribute('aria-pressed','false');
+button.addEventListener('click',function(){var shown=input.type==='password';input.type=shown?'text':'password';button.textContent=shown?'Hide':'Show';button.setAttribute('aria-pressed',String(shown));input.focus()});
+input.form&&input.form.addEventListener('submit',function(){input.type='password'});wrap.appendChild(button)})`
 
 function shell(title: string, step: SetupStep | null, completed: ReadonlySet<SetupStep>, body: string): string {
   const steps = step
@@ -81,7 +105,7 @@ function shell(title: string, step: SetupStep | null, completed: ReadonlySet<Set
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><title>${escape(title)} · StatusPing setup</title><style>${STYLES}${SETUP_STYLES}</style></head><body>
 <header class="site-header"><div class="wrap site-header-inner"><div class="account"></div></div></header>
 <main class="wrap"><div class="setup${step ? '' : ' solo'}">${steps}<section class="card setup-card">${body}</section></div></main>
-<footer class="wrap foot"><div class="foot-brand">Powered by <a href="https://statusp.ing">StatusPing</a></div></footer></body></html>`
+<footer class="wrap foot"><div class="foot-brand">Powered by <a href="https://statusp.ing">StatusPing</a></div></footer><script>${REVEAL_SCRIPT}</script></body></html>`
 }
 
 const alert = (text: string | undefined, kind: 'error' | 'warning' = 'error') =>
@@ -91,11 +115,6 @@ const hidden = (csrf: string) => `<input type="hidden" name="csrf" value="${esca
 const field = (label: string, input: string, hint = '') => {
   const id = /\bid="([^"]+)"/.exec(input)?.[1]
   return `<div class="field"><label${id ? ` for="${id}"` : ''}>${label}</label>${input}</div>${hint ? `<p class="hint">${hint}</p>` : ''}`
-}
-
-/** Shown on every public route while the instance is being set up. */
-export function setupModePage(): string {
-  return shell('Being set up', null, new Set(), `<h1>This StatusPing site is being set up</h1><p class="lead">Monitoring starts once the owner finishes setup.</p><div class="actions"><a class="btn-primary" href="/setup">Continue setup</a></div>`)
 }
 
 export function claimPage(opts: { usesEnvToken: boolean; error?: string; note?: string }): string {
@@ -121,24 +140,31 @@ export function methodPage(opts: { csrf: string; completed: ReadonlySet<SetupSte
 <form class="setup-form" method="post" action="/setup/method">${hidden(opts.csrf)}<div class="choices">
 ${choice('basic', 'Email + password (built-in)', 'One person or a small team; the quickest start', 'Nothing else', 'About 1 minute')}
 ${choice('cloudflare-access', 'Cloudflare Access', 'Sites already on Cloudflare; Google, GitHub or one-time PIN login', 'A Cloudflare Zero Trust account (free for up to 50 users)', 'About 5 minutes')}
-${choice('oidc', 'OpenID Connect (SSO)', 'Google Workspace, Microsoft Entra ID, Okta, Auth0 or Keycloak', 'Permission to register an OIDC app with your identity provider', 'About 10 minutes')}
+${choice('oidc', 'OpenID Connect (SSO)', 'Google Workspace, Microsoft Entra ID, Okta, Auth0, Keycloak or Pocket ID', 'Permission to register an OIDC app with your identity provider', 'About 10 minutes')}
 </div><div class="actions"><button class="btn-primary" type="submit">Continue</button></div></form>`)
 }
 
 /** How to add a secret on each runtime. Saving one on Cloudflare redeploys the Worker; setup resumes where it was. */
-function secretHowTo(names: string[]): string {
+function secretHowTo(names: string[], alternative = false): string {
+  if (!names.length) return ''
   const list = names.map((name) => `<code>${name}</code>`).join(' and ')
-  return `<details class="howto"><summary>How to add ${list}</summary><ul>
+  return `${alternative ? DB_NOTE : ''}<details class="howto"><summary>${alternative ? 'Use a Worker secret instead' : `How to add ${list}`}</summary><ul>
 <li><strong>Cloudflare dashboard:</strong> Workers &amp; Pages → <em>your Worker</em> → Settings → <strong>Variables and Secrets</strong> → Add → type <em>Secret</em>.</li>
 <li><strong>Wrangler:</strong> ${names.map((name) => `<code>npx wrangler secret put ${name}</code>`).join(', ')}.</li>
 <li><strong>Node:</strong> add ${names.map((name) => `<code>${name}=…</code>`).join(' and ')} to <code>.env</code> and restart.</li></ul>
 <p class="hint">Saving a secret on Cloudflare redeploys the Worker. Reload this page afterwards; setup continues where you left off.</p></details>`
 }
 
+/** Where a setting comes from: a Worker secret / env var, the DB (saved here), or nowhere. */
+export type EnvSource = 'env' | 'db' | false
+
 /** Names only, never values. */
-function envChecklist(env: Record<string, boolean>): string {
-  return `<ul class="envlist">${Object.entries(env).map(([name, set]) => `<li class="${set ? 'set' : 'missing'}"><span aria-hidden="true">${set ? '✓' : '✗'}</span> <code>${name}</code> ${set ? 'is set' : 'is missing'}</li>`).join('')}</ul>`
+function envChecklist(env: Record<string, EnvSource>): string {
+  const state = (source: EnvSource) => (source === 'env' ? 'is set as a Worker secret' : source === 'db' ? 'is saved in the database' : 'is missing')
+  return `<ul class="envlist">${Object.entries(env).map(([name, source]) => `<li class="${source ? 'set' : 'missing'}"><span aria-hidden="true">${source ? '✓' : '✗'}</span> <code>${name}</code> ${state(source)}</li>`).join('')}</ul>`
 }
+
+const DB_NOTE = '<p class="hint">Saved values are kept in this site\'s database and never shown again. A Worker secret is more protected (nobody can read it back), and takes precedence when set.</p>'
 
 function verifiedBlock(csrf: string, email: string, method: string): string {
   return `<p class="alert success" role="status">Verified. <strong>${escape(email)}</strong> signed in with ${method} and will be the first administrator.</p>
@@ -155,8 +181,8 @@ function verifySection(n: number, opts: { ready: boolean; verified: boolean; hre
   return section(n, 'Verify', `<p>${opts.intro}</p>${opts.ready ? '' : `<p class="hint">${opts.blocked}</p>`}<div class="actions">${action}<a class="btn-outline" href="/setup?step=method">Back</a></div>`)
 }
 
-export function accessPage(opts: { csrf: string; completed: ReadonlySet<SetupStep>; host: string; teamDomain?: string; audSet: boolean; verifiedEmail?: string; error?: string }): string {
-  const ready = Boolean(opts.teamDomain && opts.audSet)
+export function accessPage(opts: { csrf: string; completed: ReadonlySet<SetupStep>; host: string; teamDomain?: string; audSource: EnvSource; verifiedEmail?: string; error?: string }): string {
+  const ready = Boolean(opts.teamDomain && opts.audSource)
   return shell('Cloudflare Access', 'account', opts.completed, `<h1>Connect Cloudflare Access</h1>
 <p class="lead">Cloudflare Access signs people in before requests reach StatusPing. StatusPing then checks the signed Access token on every request.</p>${alert(opts.error)}
 ${opts.verifiedEmail ? verifiedBlock(opts.csrf, opts.verifiedEmail, 'Cloudflare Access') : ''}
@@ -167,14 +193,17 @@ ${section(1, 'Create the Access application', `<ol class="steps-list">
 <li><strong>Only sign-in</strong>: add two paths, <code>/admin</code> and <code>/auth</code>. Status pages stay public.</li></ul></li>
 <li>Add a policy: <strong>Allow</strong> → <em>Emails</em> → your email address. Add more people later in Access, not in StatusPing.</li>
 <li>Save the application and open its <strong>Overview</strong>.</li></ol>`)}
-${section(2, 'Add the audience tag', `<p>Copy the <strong>Application Audience (AUD) Tag</strong> from the Overview and store it as a secret.</p>${envChecklist({ CF_ACCESS_AUD: opts.audSet })}${opts.audSet ? '' : secretHowTo(['CF_ACCESS_AUD'])}`)}
+${section(2, 'Add the audience tag', `<p>Copy the <strong>Application Audience (AUD) Tag</strong> from the Overview.</p>${envChecklist({ CF_ACCESS_AUD: opts.audSource })}
+${opts.audSource === 'env' ? '' : `<form class="setup-form" method="post" action="/setup/stored-env">${hidden(opts.csrf)}<input type="hidden" name="return" value="access">
+${field('Application Audience (AUD) Tag', `<input class="input" id="CF_ACCESS_AUD" name="CF_ACCESS_AUD" type="text" autocomplete="off" spellcheck="false" placeholder="${opts.audSource === 'db' ? 'Saved. Enter a new value to replace it.' : '64 hexadecimal characters'}"${opts.audSource === 'db' ? '' : ' required'}>`)}
+<div class="actions"><button class="btn-outline" type="submit">Save</button></div></form>${secretHowTo(['CF_ACCESS_AUD'], true)}`}`)}
 ${section(3, 'Enter the team domain', `<form class="setup-form" method="post" action="/setup/access">${hidden(opts.csrf)}
 ${field('Team domain', `<input class="input" id="teamDomain" name="teamDomain" type="text" value="${escape(opts.teamDomain ?? '')}" placeholder="yourteam.cloudflareaccess.com" spellcheck="false" required>`, 'Shown on the application Overview. It is not secret.')}
 <div class="actions"><button class="btn-outline" type="submit">Save team domain</button></div></form>`)}
 ${verifySection(4, { ready, verified: Boolean(opts.verifiedEmail), href: '/auth/setup-verify', label: 'Verify with Cloudflare Access', intro: 'Access asks you to sign in, then StatusPing checks the token against your team domain and audience.', blocked: 'Add CF_ACCESS_AUD and save the team domain first.' })}`)
 }
 
-export function oidcPage(opts: { csrf: string; completed: ReadonlySet<SetupStep>; origin: string; preset?: string; issuer?: string; env: Record<string, boolean>; sessionKeyNote: boolean; verifiedEmail?: string; error?: string }): string {
+export function oidcPage(opts: { csrf: string; completed: ReadonlySet<SetupStep>; origin: string; preset?: string; issuer?: string; env: Record<string, EnvSource>; clientId?: string; sessionKeyNote: boolean; verifiedEmail?: string; error?: string }): string {
   const preset = presetById(opts.preset) ?? OIDC_PRESETS[0]!
   const callback = `${opts.origin}/auth/callback`
   const workersDev = /\.workers\.dev$/i.test(new URL(opts.origin).hostname)
@@ -186,7 +215,12 @@ ${opts.verifiedEmail ? verifiedBlock(opts.csrf, opts.verifiedEmail, preset.label
 <div class="setup-form">${field('Identity provider', `<select class="input" id="preset" name="preset" onchange="location.href='/setup?step=account&amp;preset='+encodeURIComponent(this.value)">${OIDC_PRESETS.map((p) => `<option value="${p.id}"${p.id === preset.id ? ' selected' : ''}>${p.label}</option>`).join('')}</select>`)}</div>
 ${section(1, `Register StatusPing with ${preset.label}`, `<p>${preset.register} (<a href="${preset.docsUrl}" target="_blank" rel="noopener">${preset.label} guide</a>)</p>
 <p>Set the redirect (callback) URL to exactly:</p><pre>${escape(callback)}</pre>${workersDev ? '<p class="alert warning">This is a <code>workers.dev</code> address. If you add a custom domain later, register its callback URL too.</p>' : ''}`)}
-${section(2, 'Add the client credentials', `<p>Store the application's client ID and client secret as secrets.</p>${envChecklist(opts.env)}${missing.length ? secretHowTo(missing) : ''}${opts.sessionKeyNote ? '<p class="hint"><code>SESSION_SECRET</code> is optional: without it StatusPing generates and stores a session signing key.</p>' : ''}`)}
+${section(2, 'Add the client credentials', `<p>Copy the client ID and client secret your provider issued for this application.</p>${envChecklist(opts.env)}
+${opts.env.OIDC_CLIENT_ID === 'env' && opts.env.OIDC_CLIENT_SECRET === 'env' ? '' : `<form class="setup-form" method="post" action="/setup/stored-env">${hidden(opts.csrf)}<input type="hidden" name="return" value="oidc">
+${opts.env.OIDC_CLIENT_ID === 'env' ? '' : field('Client ID', `<input class="input" id="OIDC_CLIENT_ID" name="OIDC_CLIENT_ID" type="text" autocomplete="off" spellcheck="false" value="${escape(opts.clientId ?? '')}">`)}
+${opts.env.OIDC_CLIENT_SECRET === 'env' ? '' : field('Client secret', `<input class="input" id="OIDC_CLIENT_SECRET" name="OIDC_CLIENT_SECRET" type="password" autocomplete="off" placeholder="${opts.env.OIDC_CLIENT_SECRET === 'db' ? 'Saved. Leave blank to keep it.' : ''}">`)}
+<div class="actions"><button class="btn-outline" type="submit">Save credentials</button></div></form>${secretHowTo(['OIDC_CLIENT_ID', 'OIDC_CLIENT_SECRET'].filter((name) => opts.env[name] !== 'env'), true)}`}
+${opts.sessionKeyNote ? '<p class="hint"><code>SESSION_SECRET</code> is optional: without it StatusPing generates and stores a session signing key.</p>' : ''}`)}
 ${section(3, 'Enter the issuer', `<form class="setup-form" method="post" action="/setup/oidc">${hidden(opts.csrf)}<input type="hidden" name="preset" value="${preset.id}">
 ${field('Issuer URL', `<input class="input" id="issuer" name="issuer" type="url" value="${escape(opts.issuer ?? preset.issuer ?? '')}" placeholder="https://…" spellcheck="false" required>`, preset.issuer ? 'Pre-filled for this provider.' : preset.issuerHint ?? '')}
 <div class="actions"><button class="btn-outline" type="submit">Save and check issuer</button></div></form>`)}
@@ -218,20 +252,57 @@ ${field('Timezone', `<input class="input" id="timezone" name="timezone" type="te
 <script>(()=>{const t=document.getElementById('timezone');if(t&&t.value==='UTC'){try{t.value=Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC'}catch{}}})()</script>`)
 }
 
-export function monitorPage(opts: { csrf: string; completed: ReadonlySet<SetupStep>; name: string; url: string; error?: string }): string {
+export type MonitorKind = 'http' | 'push' | 'tcp'
+export interface MonitorValues { name?: string; url?: string; keyword?: string; period?: string; schedule?: string; host?: string; port?: string }
+
+const MONITOR_KINDS: Array<[MonitorKind, string, string]> = [
+  ['http', 'Website', 'StatusPing checks a URL every minute.'],
+  ['push', 'Scheduled job', 'Your cron job or script pings StatusPing; you are alerted when a ping is late or missing.'],
+  ['tcp', 'TCP port', 'StatusPing checks that a port (a database, mail server, SSH…) accepts connections.'],
+]
+const PERIODS: Array<[string, string]> = [['5m', 'Every 5 minutes'], ['15m', 'Every 15 minutes'], ['30m', 'Every 30 minutes'], ['1h', 'Every hour'], ['6h', 'Every 6 hours'], ['1d', 'Every day']]
+
+export function monitorPage(opts: { csrf: string; completed: ReadonlySet<SetupStep>; kind: MonitorKind; values: MonitorValues; error?: string }): string {
+  const v = opts.values
+  const tabs = `<nav class="segmented" aria-label="Monitor type">${MONITOR_KINDS.map(([id, label]) => `<a href="/setup?step=monitor&amp;kind=${id}"${id === opts.kind ? ' aria-current="page"' : ''}>${label}</a>`).join('')}</nav>`
+  const describe = MONITOR_KINDS.find(([id]) => id === opts.kind)![2]
+  const fields = opts.kind === 'push'
+    ? `${field('Name', `<input class="input" id="name" name="name" type="text" value="${escape(v.name ?? 'Nightly backup')}" maxlength="80">`)}
+${field('How often does it run?', `<select class="input" id="period" name="period">${PERIODS.map(([value, label]) => `<option value="${value}"${(v.period ?? '1d') === value ? ' selected' : ''}>${label}</option>`).join('')}</select>`)}
+${field('Or a cron schedule (optional)', `<input class="input" id="schedule" name="schedule" type="text" value="${escape(v.schedule ?? '')}" placeholder="0 3 * * *" spellcheck="false">`, 'Use this instead when the job runs at fixed times, such as <code>0 3 * * *</code> for 3:00 every day in your site timezone.')}
+<p class="hint">After setup you get a ping URL to call at the end of the job, for example with <code>curl</code>.</p>`
+    : opts.kind === 'tcp'
+      ? `${field('Name', `<input class="input" id="name" name="name" type="text" value="${escape(v.name ?? 'Database')}" maxlength="80">`)}
+${field('Host', `<input class="input" id="host" name="host" type="text" value="${escape(v.host ?? '')}" placeholder="db.example.com" spellcheck="false">`)}
+${field('Port', `<input class="input" id="port" name="port" type="number" min="1" max="65535" value="${escape(v.port ?? '')}" placeholder="5432">`)}`
+      : `${field('Name', `<input class="input" id="name" name="name" type="text" value="${escape(v.name ?? 'Website')}" maxlength="80">`)}
+${field('URL to check', `<input class="input" id="url" name="url" type="url" value="${escape(v.url ?? '')}" placeholder="https://example.com">`)}
+${field('Text the page must contain (optional)', `<input class="input" id="keyword" name="keyword" type="text" value="${escape(v.keyword ?? '')}" maxlength="200">`, 'Catches pages that load but show an error.')}`
   return shell('First monitor', 'monitor', opts.completed, `<h1>Add a first monitor</h1>
-<p class="lead">Optional. Check a website every minute. You can add scheduled-job monitors and alert channels later in the YAML admin.</p>${alert(opts.error)}
-<form class="setup-form" method="post" action="/setup/monitor">${hidden(opts.csrf)}
-${field('Name', `<input class="input" id="name" name="name" type="text" value="${escape(opts.name)}" maxlength="80">`)}
-${field('URL to check', `<input class="input" id="url" name="url" type="url" value="${escape(opts.url)}" placeholder="https://example.com">`)}
+<p class="lead">Optional. You can add more monitors and alert channels later in the admin.</p>${alert(opts.error)}
+${tabs}<p class="hint kind-note">${describe}</p>
+<form class="setup-form" method="post" action="/setup/monitor">${hidden(opts.csrf)}<input type="hidden" name="kind" value="${opts.kind}">
+${fields}
 <div class="actions"><button class="btn-primary" type="submit">Add monitor</button><button class="btn-outline" type="submit" name="skip" value="1" formnovalidate>Skip for now</button></div></form>`)
 }
 
-export function reviewPage(opts: { csrf: string; completed: ReadonlySet<SetupStep>; yaml: string; error?: string }): string {
+export function reviewPage(opts: { csrf: string; completed: ReadonlySet<SetupStep>; summary: Array<[string, string]>; yaml: string; error?: string }): string {
   return shell('Review', 'review', opts.completed, `<h1>Review and finish</h1>
-<p class="lead">This is the configuration StatusPing will start with. After setup you edit it as YAML in the admin.</p>${alert(opts.error)}
-<pre>${escape(opts.yaml)}</pre>
+<p class="lead">StatusPing will start with these settings. You can change any of them later in the admin.</p>${alert(opts.error)}
+<dl class="summary">${opts.summary.map(([label, value]) => `<dt>${escape(label)}</dt><dd>${escape(value)}</dd>`).join('')}</dl>
+<details class="howto"><summary>Show as YAML</summary><p class="hint">This is the configuration file the admin lets you edit directly.</p><pre>${escape(opts.yaml)}</pre></details>
 <form method="post" action="/setup/finish">${hidden(opts.csrf)}<div class="actions"><button class="btn-primary" type="submit">Finish setup</button><a class="btn-outline" href="/setup?step=monitor">Back</a></div></form>`)
+}
+
+/** Shown once after setup when the first monitor is a scheduled job: its ping URL is never shown again. */
+export function setupDonePage(opts: { pingUrl: string; monitorName: string }): string {
+  return shell('Setup complete', null, new Set(), `<h1>Setup is complete</h1>
+<p class="lead">Checks start within a minute. One last thing for <strong>${escape(opts.monitorName)}</strong>: have the job call its ping URL when it finishes.</p>
+<p class="alert warning">This URL is shown only once. Copy it now; anyone with it can report on this job. You can generate a new one in the admin.</p>
+<p class="secret">${escape(opts.pingUrl)}</p>
+<p>For example, at the end of the job:</p><pre>curl -fsS ${escape(opts.pingUrl)}</pre>
+<p class="hint">To report a failure instead, call <code>${escape(opts.pingUrl)}/fail</code>; to track run time, call <code>${escape(opts.pingUrl)}/start</code> when the job begins.</p>
+<div class="actions"><a class="btn-primary" href="/admin">Go to the admin</a></div>`)
 }
 
 export function resetPage(opts: { error?: string }): string {

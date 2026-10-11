@@ -21,6 +21,8 @@ function browser(app: ReturnType<typeof createApp>) {
       if (/max-age=0|expires=thu, 01 jan 1970/i.test(cookie) || value.join('=') === '') jar.delete(name!)
       else jar.set(name!, value.join('='))
     }
+    // /setup redirects to the address of the current step, as a browser would follow.
+    if (path === '/setup' && !init.method && res.status === 302) return send(res.headers.get('location')!, init)
     return { res, body: await res.text() }
   }
   return {
@@ -68,9 +70,11 @@ describe('first-run setup wizard and reset', () => {
 
     // Setup mode: public routes show the setup page, /healthz stays 200, ticks run no checks.
     const home = await b.get('/')
-    expect(home.res.status).toBe(503)
-    expect(home.body).toContain('This StatusPing site is being set up')
+    expect(home.res.status).toBe(302)
+    expect(home.res.headers.get('location')).toBe('/setup')
+    expect((await b.get('/admin')).res.headers.get('location')).toBe('/setup')
     expect((await b.get(`/ping/${TEST_TOKENS.heartbeat}`)).res.status).toBe(503)
+    expect((await b.post('/auth/login', { email: 'x@example.test', password: 'x' })).res.status).toBe(503)
     expect(await (await app.request(`${ORIGIN}/healthz`)).json()).toMatchObject({ ok: true, setup: 'required' })
     const summary = await tick(deps, Date.parse('2026-10-11T00:00:00Z'))
     expect(summary.checks).toBe(0)
@@ -132,12 +136,12 @@ describe('first-run setup wizard and reset', () => {
     // Finish signs the owner in and ends setup mode.
     const finish = await b.post('/setup/finish', { csrf })
     expect(finish.res.status).toBe(303)
-    expect(finish.res.headers.get('location')).toMatch(/^\/admin\?message=/)
+    expect(finish.res.headers.get('location')).toBe('/')
     expect(b.jar.has('sp_session')).toBe(true)
-    const admin = await b.get('/admin?message=Setup%20is%20complete.')
+    const admin = await b.get('/admin')
     expect(admin.res.status).toBe(200)
-    expect(admin.body).toContain('Signed in as owner@example.test')
-    expect(admin.body).toContain('title: Acme')
+    expect(admin.body).toContain('<span class="muted small account-email">owner@example.test</span>')
+    expect(admin.body).toContain('value="Acme"')
 
     expect((await b.get('/setup')).res.status).toBe(404)
     expect((await b.post('/setup/finish', { csrf })).res.status).toBe(404)
@@ -170,6 +174,45 @@ describe('first-run setup wizard and reset', () => {
     expect((await c.post('/setup/claim', { code: 'my-own-setup-token' })).res.status).toBe(303)
   })
 
+  it('sets up a scheduled job, shows its ping URL once, and keeps the token across config changes', async () => {
+    const { app, db, deps } = await instance({ STATUSPING_RESET_TOKEN: RESET_TOKEN })
+    const b = browser(app)
+    await b.post('/setup/reset', { token: RESET_TOKEN, confirm: 'reset' })
+    await b.post('/setup/claim', { code: (await loadSetupState(db))!.code! })
+    const csrf = csrfOf((await b.get('/setup')).body)
+    await b.post('/setup/method', { csrf, method: 'basic' })
+    const password = 'owner-password-123'
+    await b.post('/setup/account', { csrf, email: 'owner@example.test', password, confirm: password })
+    await b.post('/setup/basics', { csrf, title: 'Jobs', baseUrl: ORIGIN, timezone: 'Europe/London' })
+
+    // Each type has its own form; invalid input is explained.
+    expect((await b.get('/setup?step=monitor&kind=tcp')).body).toContain('name="port"')
+    expect((await b.post('/setup/monitor', { csrf, kind: 'tcp', name: 'DB', host: 'db.example.test', port: '70000' })).body).toContain('between 1 and 65535')
+    expect((await b.post('/setup/monitor', { csrf, kind: 'push', name: 'Backup', schedule: 'not a cron' })).body).toContain('is not a valid cron schedule')
+    expect((await b.post('/setup/monitor', { csrf, kind: 'push', name: 'Backup', period: '1d', schedule: '0 3 * * *' })).res.status).toBe(303)
+
+    // The review is in plain words; the YAML is tucked away.
+    const review = (await b.get('/setup')).body
+    expect(review).toContain('<dt>First monitor</dt><dd>Backup: a scheduled job expected on the cron schedule 0 3 * * *</dd>')
+    expect(review).toContain('<dt>Sign-in</dt><dd>Email and password</dd>')
+    expect(review).toContain('<summary>Show as YAML</summary>')
+
+    const done = await b.post('/setup/finish', { csrf })
+    expect(done.res.status).toBe(200)
+    const pingUrl = /<p class="secret">([^<]+)<\/p>/.exec(done.body)![1]!
+    expect(pingUrl).toMatch(new RegExp(`^${ORIGIN}/ping/[A-Za-z0-9]{40}$`))
+    expect(done.body).toContain(`curl -fsS ${pingUrl}`)
+    const path = new URL(pingUrl).pathname
+    expect((await b.get(path)).res.status).toBe(200)
+
+    // A later config change (as the YAML admin would make) must not discard the generated token.
+    const stored = JSON.parse((await db.first<{ config_json: string }>(`SELECT config_json FROM admin_config`))!.config_json)
+    stored.groups[0].monitors[0].name = 'Nightly backup'
+    await db.run(`UPDATE admin_config SET config_json = ? WHERE id = 1`, [JSON.stringify(stored)])
+    await tick(deps, Date.parse('2026-10-11T00:05:00Z'))
+    expect((await b.get(path)).res.status).toBe(200)
+  })
+
   it('a second reset ends existing sessions and keeps the replaced configuration', async () => {
     const { app, db } = await instance({ STATUSPING_RESET_TOKEN: RESET_TOKEN })
     const b = browser(app)
@@ -189,7 +232,7 @@ describe('first-run setup wizard and reset', () => {
     expect(status.body).not.toContain('Monitoring may be stalled')
 
     await browser(app).post('/setup/reset', { token: RESET_TOKEN, confirm: 'reset' })
-    expect((await b.get('/admin')).res.status).toBe(503)
+    expect((await b.get('/admin')).res.headers.get('location')).toBe('/setup')
     const row = await db.first<{ previous_config_json: string }>(`SELECT previous_config_json FROM setup_state WHERE id = 1`)
     expect(JSON.parse(row!.previous_config_json)).toMatchObject({ title: 'First' })
     expect(await db.first(`SELECT * FROM local_users`)).toBeNull()
