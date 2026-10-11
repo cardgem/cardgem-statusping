@@ -136,13 +136,22 @@ Every YAML import is parsed as safe plain data, validated by the same StatusPing
 
 When browser admin is enabled, the validated D1-backed configuration becomes the running configuration. The checked-in configuration or `STATUSPING_CONFIG` remains the initial seed and is still the recommended approach for automated or version-controlled deployments.
 
+## Change the sign-in method
+
+Settings → Access → **Change sign-in method** switches between email and password, Cloudflare Access and OpenID Connect without taking the site offline. You enter the new settings, then run a real test sign-in as an administrator; the current method keeps working until that succeeds and you choose **Switch**. Switching signs everyone else out.
+
 ## Connect AI assistants (MCP)
 
 With the browser admin enabled, StatusPing is also a remote [MCP](https://modelcontextprotocol.io) server at `https://<your-site>/mcp`. Create a token in **Settings → MCP** and choose what it can do:
 
-- **Read status**: `get_status`, `get_monitor`, `list_incidents`.
-- **Post incidents**: `create_incident`, `update_incident` (these may notify subscribers and alert channels).
-- **Manage monitors**: `add_monitor`, `update_monitor`, `delete_monitor`.
+- **Read status**: `get_status`, `get_monitor`, `list_incidents`, `list_status_pages`, `list_maintenance`.
+- **Post incidents**: `create_incident`, `update_incident`, `acknowledge_alert` (incidents may notify subscribers and alert channels).
+- **Manage monitors**: `add_monitor`, `update_monitor`, `delete_monitor`, `rotate_ping_url`, `add_maintenance`, `delete_maintenance`.
+- **Manage status pages**: `add_status_page`, `update_status_page`, `delete_status_page`, `set_home_page`.
+- **Manage alert channels**: `list_channels`, `add_channel`, `update_channel`, `delete_channel`, `test_channel` (credentials are write-only).
+- **Manage settings**: `get_settings`, `update_settings`, `set_administrators`, `check_for_updates`, `get_configuration`, `import_configuration` (previews unless `apply: true`), `get_activity`.
+
+Resetting the site, changing the sign-in method and creating MCP tokens stay in the browser.
 
 The token is shown once and only its hash is stored; revoke it in the same place. For Claude Code:
 
@@ -181,6 +190,29 @@ After setup, the configuration lives in the database and is edited as YAML in `/
 `statusping.config.ts` is no longer used. Passwords chosen in the wizard are stored as
 PBKDF2-SHA256 (50,000 iterations, which fits the Workers free plan's CPU limit), and password
 sign-in is limited to 10 attempts per minute per address.
+
+## Hosted platform tenants
+
+StatusPing can also run as one tenant of a hosted, multi-tenant platform. Each tenant
+has its own Worker and its own D1 database. Self-hosted instances never set the
+variables below, and none of this applies to them.
+
+- `STATUSPING_TENANT` is a JSON plan policy set by the platform:
+  `{"tenantId","plan","maxMonitors","minIntervalMin","maxPages","historyDays","suspended","suspendedMessage"}`.
+  An admin, setup or MCP save over the plan's limits is rejected. A configuration
+  that is already stored is fitted to the plan instead (extra monitors and pages
+  are dropped, intervals are raised), so a downgrade never takes a site down.
+  Retention keeps at most `historyDays` of history.
+- While `suspended` is true, every page shows a banner, ticks run no checks or
+  alerts, and `/ping` answers 503.
+- `STATUSPING_PLATFORM_SECRET` signs the platform's requests:
+  `POST /internal/tick` (the platform drives ticks) and `GET /internal/export`
+  (a JSON export of the tenant's data; credentials and sign-in state are left
+  out). Each signature is an HMAC bound to the method, path, tenant id and a
+  timestamp that must be within 5 minutes of the tenant's clock. Without a
+  policy and a secret, these routes do not exist.
+- A new tenant that has `STATUSPING_SETUP_TOKEN` set starts in the setup
+  wizard. Its owner claims it with that token.
 
 ## Run on Node and use an independent confirmation peer
 

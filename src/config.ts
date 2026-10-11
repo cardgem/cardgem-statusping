@@ -217,9 +217,54 @@ export interface EmailSinkInput {
   type: 'email'
   /** Recipients must be verified when using Cloudflare Email Routing. */
   to: string[]
-  via: 'cloudflare' | { provider: 'resend'; apiKey: Secret; from: string }
+  via: 'cloudflare' | { provider: 'resend'; apiKey: Secret; from: string } | SmtpViaInput
+}
+/** Your own mail server. Port 465 uses TLS from the start; 587 upgrades with STARTTLS. Plaintext is not supported. */
+export interface SmtpViaInput {
+  provider: 'smtp'
+  host: string
+  port: number
+  security: 'tls' | 'starttls'
+  username?: string
+  password?: Secret
+  from: string
+}
+/** A Microsoft Teams Workflows ("Post to a channel when a webhook request is received") URL. */
+export interface TeamsSinkInput {
+  type: 'teams'
+  webhookUrl: Secret
+}
+export interface GoogleChatSinkInput {
+  type: 'googlechat'
+  webhookUrl: Secret
+}
+export interface MattermostSinkInput {
+  type: 'mattermost'
+  webhookUrl: Secret
+}
+export interface MatrixSinkInput {
+  type: 'matrix'
+  /** Such as https://matrix.org. */
+  homeserver: string
+  accessToken: Secret
+  /** Room ID, such as !abc123:matrix.org. The bot account must have joined the room. */
+  roomId: string
+}
+export interface GotifySinkInput {
+  type: 'gotify'
+  server: string
+  /** An application token. */
+  token: Secret
+}
+/** PagerDuty Events API v2. Outages trigger an incident; recovery resolves it. */
+export interface PagerDutySinkInput {
+  type: 'pagerduty'
+  routingKey: Secret
 }
 export type SinkInput = PushoverSinkInput | NtfySinkInput | TelegramSinkInput | WebhookSinkInput | DiscordSinkInput | SlackSinkInput | EmailSinkInput
+  | TeamsSinkInput | GoogleChatSinkInput | MattermostSinkInput | MatrixSinkInput | GotifySinkInput | PagerDutySinkInput
+/** Every alert channel type, in the order Settings lists them. */
+export const SINK_TYPES = ['slack', 'discord', 'teams', 'googlechat', 'mattermost', 'telegram', 'matrix', 'pushover', 'ntfy', 'gotify', 'pagerduty', 'email', 'webhook'] as const
 
 /** Delivery settings for status-page subscribers.  This intentionally does not
  * reuse an arbitrary alert sink: subscribers need a provider that can deliver
@@ -661,9 +706,15 @@ export function normalizeConfig(config: StatusPingConfig): NormalizedConfig {
     }
   }
   for (const [name, sink] of Object.entries(sinks)) {
-    if (!['pushover', 'ntfy', 'telegram', 'webhook', 'discord', 'slack', 'email'].includes(sink.type)) {
+    if (!(SINK_TYPES as readonly string[]).includes(sink.type)) {
       problems.push(`sinks.${name}: unknown type "${(sink as { type: string }).type}"`)
     }
+    if (sink.type === 'matrix' || sink.type === 'gotify') {
+      const base = sink.type === 'matrix' ? sink.homeserver : sink.server
+      const key = sink.type === 'matrix' ? 'homeserver' : 'server'
+      try { if (new URL(base).protocol !== 'https:') problems.push(`sinks.${name}.${key}: must be an https:// URL`) } catch { problems.push(`sinks.${name}.${key}: "${base}" is not a valid URL`) }
+    }
+    if (sink.type === 'matrix' && (typeof sink.roomId !== 'string' || !/^![^:\s]+:\S+$/.test(sink.roomId))) problems.push(`sinks.${name}.roomId: must look like !abc123:example.org`)
     if (sink.type === 'webhook') {
       try {
         const url = new URL(sink.url)
@@ -682,9 +733,18 @@ export function normalizeConfig(config: StatusPingConfig): NormalizedConfig {
         problems.push(`sinks.${name}.to: must contain one or more email addresses`)
       }
       if (sink.via !== 'cloudflare') {
-        if (!sink.via || sink.via.provider !== 'resend') problems.push(`sinks.${name}.via: provider must be "resend"`)
+        if (!sink.via || (sink.via.provider !== 'resend' && sink.via.provider !== 'smtp')) problems.push(`sinks.${name}.via: provider must be "resend" or "smtp"`)
         else if (typeof sink.via.from !== 'string' || !isMailbox(sink.via.from)) {
           problems.push(`sinks.${name}.via.from: must be an email address`)
+        }
+        if (sink.via && typeof sink.via === 'object' && sink.via.provider === 'smtp') {
+          const smtp = sink.via
+          if (typeof smtp.host !== 'string' || !/^[a-z0-9.-]+$/i.test(smtp.host)) problems.push(`sinks.${name}.via.host: must be a host name`)
+          if (!Number.isInteger(smtp.port) || smtp.port < 1 || smtp.port > 65535) problems.push(`sinks.${name}.via.port: must be a port number`)
+          else if (smtp.port === 25) problems.push(`sinks.${name}.via.port: port 25 is blocked on Cloudflare; use 465 or 587`)
+          if (smtp.security !== 'tls' && smtp.security !== 'starttls') problems.push(`sinks.${name}.via.security: must be "tls" or "starttls"`)
+          if (smtp.username !== undefined && typeof smtp.username !== 'string') problems.push(`sinks.${name}.via.username: must be a string`)
+          if (smtp.username && smtp.password === undefined) problems.push(`sinks.${name}.via.password: required with a username`)
         }
       }
     }

@@ -71,6 +71,7 @@ const APP_STYLES = `
 .incident-body { margin: 6px 0 0 28px; font-size: 15px; line-height: 1.55; color: var(--foreground); overflow-wrap: anywhere; }
 .incident-meta { display: flex; flex-wrap: wrap; gap: 0 8px; margin: 8px 0 0 28px; font-size: 14px; color: var(--muted-foreground); }
 .stale-warning { font-size: 14px; color: var(--destructive); }
+.site-notice { margin: 16px 0 0; padding: 12px 16px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--muted); font-size: 14px; }
 .warning-incidents { border-top: 1px solid color-mix(in oklab, var(--warning) 30%, var(--border)); }
 .warning-incident { background: color-mix(in oklab, var(--warning) 8%, var(--muted)); }
 
@@ -174,6 +175,9 @@ tr.has-detail:has(details[open]) + .detail-row { display: table-row; }
 tr.has-detail:has(details[open]) td { border-bottom-color: transparent; }
 tbody tr.detail-row:hover { background: none; }
 .runs th:first-child, .runs td:first-child { width: 100%; }
+/* Error detail keeps a readable width on phones; the table scrolls sideways instead of crushing it. */
+.incident-detail { min-width: 14em; }
+.scroll:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; border-radius: 4px; }
 .detail-row td { height: auto; padding: 0 0 14px; }
 .run-detail { margin-left: 20px; padding: 2px 0 4px; }
 .run-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px 24px; margin: 0; }

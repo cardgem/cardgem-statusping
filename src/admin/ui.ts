@@ -4,7 +4,7 @@
  * (Show/Hide on secret fields, loading an import file).
  */
 import type { Viewer } from '../auth/viewer.ts'
-import type { MonitorInput, PageInput, SinkInput } from '../config.ts'
+import { type MonitorInput, type PageInput, type SinkInput, SINK_TYPES } from '../config.ts'
 import type { AuditEntry } from './service.ts'
 import type { MonitorRow, SinkType } from './forms.ts'
 import { SINK_FIELDS } from './forms.ts'
@@ -36,14 +36,16 @@ const SECTIONS: Array<[Section, string, string]> = [
 ]
 
 const ADMIN_STYLES = `
+[hidden] { display: none !important; }
 .settings { display: grid; grid-template-columns: 200px minmax(0, 1fr); gap: 32px; align-items: start; }
+.settings > * { min-width: 0; }
 .settings-nav ul { margin: 0; padding: 0; list-style: none; display: grid; gap: 2px; }
 .settings-nav a { display: block; padding: 6px 10px; border-radius: calc(var(--radius) - 4px); font-size: 14px; color: var(--muted-foreground); }
 .settings-nav a:hover { background: var(--accent); color: var(--foreground); text-decoration: none; }
 .settings-nav a[aria-current="page"] { background: var(--muted); color: var(--foreground); font-weight: 500; }
 .settings-nav .nav-foot { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border); }
 @media (max-width: 760px) {
-  .settings { grid-template-columns: 1fr; gap: 16px; }
+  .settings { grid-template-columns: minmax(0, 1fr); gap: 16px; }
   .settings-nav ul { display: flex; gap: 4px; overflow-x: auto; padding-bottom: 4px; }
   .settings-nav a { white-space: nowrap; } .settings-nav .nav-foot { display: none; }
 }
@@ -69,8 +71,10 @@ textarea.code { min-height: 24rem; font: 13px/1.5 ui-monospace, SFMono-Regular, 
 .alert.success { border-color: color-mix(in oklab, var(--success) 55%, var(--border)); background: color-mix(in oklab, var(--success) 8%, var(--card)); }
 .table { width: 100%; border-collapse: collapse; font-size: 14px; }
 .table th { padding: 0 12px 8px 0; text-align: left; font-weight: 500; color: var(--muted-foreground); border-bottom: 1px solid var(--border); }
-.table td { padding: 10px 12px 10px 0; border-bottom: 1px solid var(--border); vertical-align: middle; }
+.table td { padding: 10px 12px 10px 0; border-bottom: 1px solid var(--border); vertical-align: middle; overflow-wrap: normal; }
 .table tr:last-child td { border-bottom: 0; } .table tbody tr:hover { background: transparent; } .table td.end { text-align: right; white-space: nowrap; padding-right: 0; }
+.table td:first-child { min-width: 9em; }
+.scroll:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; border-radius: 4px; }
 .table .sub { display: block; color: var(--muted-foreground); font-size: 13px; overflow-wrap: anywhere; }
 .badge { display: inline-flex; align-items: center; height: 22px; padding: 0 8px; border: 1px solid var(--border); border-radius: 999px; font-size: 12px; font-weight: 500; white-space: nowrap; }
 .empty { padding: 24px; text-align: center; color: var(--muted-foreground); }
@@ -91,13 +95,13 @@ var b=document.createElement('button');b.type='button';b.className='btn-outline 
 b.addEventListener('click',function(){var s=input.type==='password';input.type=s?'text':'password';b.textContent=s?'Hide':'Show';b.setAttribute('aria-pressed',String(s));input.focus()});
 input.form&&input.form.addEventListener('submit',function(){input.type='password'});wrap.appendChild(b)})`
 
-const hidden = (csrf: string) => `<input type="hidden" name="csrf" value="${escape(csrf)}">`
-const field = (label: string, input: string, hint = '') => {
+export const hidden = (csrf: string) => `<input type="hidden" name="csrf" value="${escape(csrf)}">`
+export const field = (label: string, input: string, hint = '') => {
   const id = /\bid="([^"]+)"/.exec(input)?.[1]
   return `<div class="field"><label${id ? ` for="${id}"` : ''}>${label}</label>${input}</div>${hint ? `<p class="hint">${hint}</p>` : ''}`
 }
-const textInput = (name: string, value: string | number | undefined, attrs = '') => `<input class="input" id="${name}" name="${name}" value="${escape(String(value ?? ''))}" ${attrs}>`
-const selectInput = (name: string, options: Array<[string, string]>, current: string | undefined) =>
+export const textInput = (name: string, value: string | number | undefined, attrs = '') => `<input class="input" id="${name}" name="${name}" value="${escape(String(value ?? ''))}" ${attrs}>`
+export const selectInput = (name: string, options: Array<[string, string]>, current: string | undefined) =>
   `<select class="input" id="${name}" name="${name}">${options.map(([value, label]) => `<option value="${escape(value)}"${value === current ? ' selected' : ''}>${escape(label)}</option>`).join('')}</select>`
 const notice = (text: string | undefined, kind: 'error' | 'success' = 'success') =>
   !text ? '' : kind === 'error' ? `<p class="form-error" role="alert">${escape(text)}</p>` : `<p class="alert success" role="status">${escape(text)}</p>`
@@ -165,7 +169,7 @@ export function monitorsPage(opts: { viewer: Viewer; rows: MonitorRow[]; notice?
 <td><span class="badge">${KIND_LABEL[monitor.kind]}</span></td><td>${escape(group)}</td><td class="end"><a class="btn-outline" href="/admin/monitors/${encodeURIComponent(monitor.id)}">Edit</a></td></tr>`).join('')
   return layout({ ...opts, section: 'monitors', title: 'Monitors', description: 'What StatusPing checks, and how often.', body: `
 <section class="card">${add}</section>
-<section class="card">${opts.rows.length ? `<table class="table"><thead><tr><th>Monitor</th><th>Type</th><th>Group</th><th></th></tr></thead><tbody>${rows}</tbody></table>` : '<p class="empty">No monitors yet. Add one above.</p>'}</section>` })
+<section class="card">${opts.rows.length ? `<div class="scroll" tabindex="0" role="region" aria-label="Monitors"><table class="table"><thead><tr><th>Monitor</th><th>Type</th><th>Group</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody>${rows}</tbody></table></div>` : '<p class="empty">No monitors yet. Add one above.</p>'}</section>` })
 }
 
 export function monitorForm(opts: { viewer: Viewer; csrf: string; kind: MonitorInput['kind']; monitor?: MonitorInput; values?: Record<string, string>; group: string; groups: string[]; sinks: string[]; timezone: string; pingPath?: string; error?: string }): string {
@@ -224,9 +228,9 @@ export function pagesPage(opts: { viewer: Viewer; csrf: string; pages: PageInput
     ? `<form method="post" action="/admin/pages/${encodeURIComponent(slug)}/home" style="display:inline">${hidden(opts.csrf)}<button class="btn-outline" type="submit">Make home page</button></form> ` : ''
   const rows = opts.pages.map((p) => `<tr><td><a href="/admin/pages/${encodeURIComponent(p.slug)}"><strong>${escape(p.title)}</strong></a><span class="sub">/${escape(p.slug)}${opts.pages.length > 1 && p.slug === opts.home ? ' · home page (/)' : ''}</span></td>
 <td><span class="badge">${p.access === undefined || p.access === 'public' ? 'Public' : 'Private'}</span></td><td>${p.monitors.includes('*') ? 'All monitors' : `${p.monitors.length} monitor${p.monitors.length === 1 ? '' : 's'}`}</td>
-<td class="end">${makeHome(p.slug)}<a class="btn-outline" href="/${encodeURIComponent(p.slug)}">View</a> <a class="btn-outline" href="/admin/pages/${encodeURIComponent(p.slug)}">Edit</a></td></tr>`).join('')
+<td class="end">${makeHome(p.slug)}<a class="btn-outline" href="/pages/${encodeURIComponent(p.slug)}">View</a> <a class="btn-outline" href="/admin/pages/${encodeURIComponent(p.slug)}">Edit</a></td></tr>`).join('')
   return layout({ ...opts, section: 'pages', title: 'Status pages', description: 'Who sees which monitors.', actions: '<a class="btn-primary" href="/admin/pages/new">Add page</a>', body: `
-<section class="card"><table class="table"><thead><tr><th>Page</th><th>Visibility</th><th>Shows</th><th></th></tr></thead><tbody>${rows}</tbody></table></section>` })
+<section class="card"><div class="scroll" tabindex="0" role="region" aria-label="Status pages"><table class="table"><thead><tr><th>Page</th><th>Visibility</th><th>Shows</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody>${rows}</tbody></table></div></section>` })
 }
 
 export function pageForm(opts: { viewer: Viewer; csrf: string; page?: PageInput; monitors: Array<{ id: string; name: string }>; values?: Record<string, string>; error?: string }): string {
@@ -257,12 +261,35 @@ ${editing ? `<section class="card danger"><h2>Delete page</h2><p class="lead">Mo
 // ── Alert channels ──────────────────────────────────────────────────────────────────────────
 
 export function channelsPage(opts: { viewer: Viewer; csrf: string; sinks: Array<{ name: string; type: SinkType }>; notice?: string; error?: string }): string {
-  const add = `<div class="add-menu">${(Object.keys(SINK_FIELDS) as SinkType[]).map((type, i) => `<a class="${i === 0 ? 'btn-primary' : 'btn-outline'}" href="/admin/channels/new?type=${type}">${SINK_FIELDS[type].label}</a>`).join('')}</div>`
+  const add = `<div class="add-menu">${(SINK_TYPES as readonly SinkType[]).map((type, i) => `<a class="${i === 0 ? 'btn-primary' : 'btn-outline'}" href="/admin/channels/new?type=${type}">${SINK_FIELDS[type].label}</a>`).join('')}</div>`
   const rows = opts.sinks.map((s) => `<tr><td><a href="/admin/channels/${encodeURIComponent(s.name)}"><strong>${escape(s.name)}</strong></a></td><td><span class="badge">${SINK_FIELDS[s.type]?.label ?? s.type}</span></td>
 <td class="end"><form method="post" action="/admin/sinks/${encodeURIComponent(s.name)}/test" style="display:inline">${hidden(opts.csrf)}<button class="btn-outline" type="submit">Send test</button></form> <a class="btn-outline" href="/admin/channels/${encodeURIComponent(s.name)}">Edit</a></td></tr>`).join('')
   return layout({ ...opts, section: 'channels', title: 'Alert channels', description: 'Where StatusPing sends alerts. Monitors use every channel unless they choose otherwise.', body: `
 <section class="card"><h2>Add a channel</h2><p class="lead">Choose where alerts should go.</p>${add}</section>
-<section class="card">${opts.sinks.length ? `<table class="table"><thead><tr><th>Channel</th><th>Type</th><th></th></tr></thead><tbody>${rows}</tbody></table>` : '<p class="empty">No alert channels yet.</p>'}</section>` })
+<section class="card">${opts.sinks.length ? `<div class="scroll" tabindex="0" role="region" aria-label="Alert channels"><table class="table"><thead><tr><th>Channel</th><th>Type</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody>${rows}</tbody></table></div>` : '<p class="empty">No alert channels yet.</p>'}</section>` })
+}
+
+/** Email has three ways to send; only the chosen one's fields are shown. */
+function emailFields(opts: { sources: Record<string, { source: SecretSource; envName?: string }>; values?: Record<string, string> }, s: Record<string, unknown>, editing: boolean): string {
+  const via = s.via && typeof s.via === 'object' ? s.via as Record<string, unknown> : {}
+  const v = (key: string, saved: unknown) => opts.values?.[key] ?? (saved === undefined ? '' : String(saved))
+  const chosen = opts.values?.via ?? (typeof via.provider === 'string' ? via.provider : editing ? 'cloudflare' : 'smtp')
+  const secret = (key: string, label: string) => {
+    const state = opts.sources[key]
+    const status = !state?.source ? '' : state.source === 'env' ? `<span class="secret-state ok">✓ From the Worker secret <code>${escape(state.envName ?? '')}</code></span>` : '<span class="secret-state ok">✓ Saved. Leave blank to keep it.</span>'
+    return field(label, `<input class="input" id="${key}" name="${key}" type="password" autocomplete="off">`, status)
+  }
+  return `${field('Recipients', `<textarea class="input" id="to" name="to" placeholder="ops@example.com">${escape(opts.values?.to ?? (Array.isArray(s.to) ? (s.to as string[]).join('\n') : ''))}</textarea>`, 'One per line.')}
+${field('Send with', selectInput('via', [['smtp', 'Your mail server (SMTP)'], ['resend', 'Resend'], ['cloudflare', 'Cloudflare Email Routing']], chosen))}
+<div data-via="smtp resend">${field('From address', textInput('from', v('from', via.from), 'placeholder="StatusPing &lt;alerts@example.com&gt;"'))}</div>
+<div data-via="smtp" class="form">
+${field('Mail server', textInput('smtpHost', v('smtpHost', via.host), 'placeholder="smtp.example.com" spellcheck="false"'))}
+<div class="grid-2">${field('Port', textInput('smtpPort', v('smtpPort', via.port ?? 587), 'inputmode="numeric"'), '587 for STARTTLS, 465 for TLS. Port 25 is blocked on Cloudflare.')}
+${field('Encryption', selectInput('smtpSecurity', [['starttls', 'STARTTLS'], ['tls', 'TLS']], v('smtpSecurity', via.security ?? 'starttls')))}</div>
+${field('Username', textInput('smtpUsername', v('smtpUsername', via.username), 'autocomplete="off" spellcheck="false"'), 'Leave blank if the server does not need you to sign in.')}
+${secret('password', 'Password')}</div>
+<div data-via="resend">${secret('apiKey', 'Resend API key')}</div>
+<script>(function(){var s=document.getElementById('via');function u(){document.querySelectorAll('[data-via]').forEach(function(e){e.hidden=e.getAttribute('data-via').split(' ').indexOf(s.value)<0})}s.addEventListener('change',u);u()})()</script>`
 }
 
 export function channelForm(opts: { viewer: Viewer; csrf: string; type: SinkType; name?: string; sink?: SinkInput; sources: Record<string, { source: SecretSource; envName?: string }>; values?: Record<string, string>; error?: string }): string {
@@ -270,7 +297,7 @@ export function channelForm(opts: { viewer: Viewer; csrf: string; type: SinkType
   const editing = Boolean(opts.sink)
   const s = (opts.sink ?? {}) as Record<string, unknown>
   const via = s.via && typeof s.via === 'object' ? s.via as Record<string, unknown> : null
-  const fields = spec.fields.map((f) => {
+  const fields = opts.type === 'email' ? emailFields(opts, s, editing) : spec.fields.map((f) => {
     if (f.key === 'to') return field('Recipients', `<textarea class="input" id="to" name="to" placeholder="${escape(f.placeholder ?? '')}">${escape(opts.values?.to ?? (Array.isArray(s.to) ? (s.to as string[]).join('\n') : ''))}</textarea>`, 'One per line.')
     if (f.key === 'via') return field('Send with', selectInput('via', [['cloudflare', 'Cloudflare Email Routing'], ['resend', 'Resend']], opts.values?.via ?? (via ? 'resend' : 'cloudflare')))
     if (f.key === 'from') return field(f.label, textInput('from', opts.values?.from ?? (via?.from as string | undefined), `placeholder="${escape(f.placeholder ?? '')}"`))
@@ -296,7 +323,7 @@ ${editing ? `<section class="card danger"><h2>Delete channel</h2><p class="lead"
 
 export function accessPage(opts: { viewer: Viewer; csrf: string; providerSummary: string; admins: string[]; notice?: string; error?: string; values?: Record<string, string> }): string {
   return layout({ ...opts, section: 'access', title: 'Access', description: 'Who can sign in to Settings.', body: `
-<section class="card"><h2>Sign-in method</h2><p class="lead" style="margin:0">${opts.providerSummary}</p></section>
+<section class="card"><h2>Sign-in method</h2><p class="lead">${opts.providerSummary}</p><div class="actions"><a class="btn-outline" href="/admin/access/method">Change sign-in method</a></div></section>
 <section class="card"><h2>Administrators</h2><p class="lead">These people can open Settings after signing in.</p>
 <form class="form" method="post" action="/admin/access">${hidden(opts.csrf)}
 ${field('Administrator emails', `<textarea class="input" id="admins" name="admins" placeholder="one per line, or *@your-domain.com">${escape(opts.values?.admins ?? opts.admins.join('\n'))}</textarea>`, 'You cannot remove yourself; another administrator has to.')}
@@ -315,7 +342,7 @@ export function mcpPage(opts: { viewer: Viewer; csrf: string; baseUrl: string; t
 <td class="end"><form method="post" action="/admin/mcp/${t.id}/revoke" style="display:inline">${hidden(opts.csrf)}<button class="btn-outline" type="submit">Revoke</button></form></td></tr>`).join('')
   return layout({ ...opts, section: 'mcp', title: 'MCP', description: 'Let AI assistants such as Claude read your status and, if you allow it, post incidents or manage monitors.', body: `
 <section class="card"><h2>Server address</h2><p class="lead">Add this to an MCP client, with a token below as a bearer token.</p><pre>${escape(endpoint)}</pre></section>
-${rows ? `<section class="card"><table class="table"><thead><tr><th>Token</th><th>Can</th><th>Last used</th><th></th></tr></thead><tbody>${rows}</tbody></table></section>` : ''}
+${rows ? `<section class="card"><div class="scroll" tabindex="0" role="region" aria-label="MCP tokens"><table class="table"><thead><tr><th>Token</th><th>Can</th><th>Last used</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody>${rows}</tbody></table></div></section>` : ''}
 <section class="card"><h2>Create a token</h2><p class="lead">Give each assistant or person its own token, so you can revoke it on its own.</p>
 <form class="form" method="post" action="/admin/mcp">${hidden(opts.csrf)}
 ${field('Name', textInput('name', [opts.values?.name ?? ''].flat()[0], 'maxlength="60" placeholder="for example Claude on my laptop" required'))}

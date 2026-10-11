@@ -19,6 +19,7 @@ import { parseAdminYaml, stringifyAdminYaml } from './yaml.ts'
 import { beginSetup } from '../setup/state.ts'
 import { deleteCookie } from 'hono/cookie'
 import { checkForUpdate } from '../updates.ts'
+import { mountAccessSwitch } from './access-switch.ts'
 import { createApiToken, isMcpScope, listApiTokens, revokeApiToken } from '../mcp/tokens.ts'
 import { APP_VERSION } from '../version.ts'
 
@@ -42,6 +43,11 @@ const NOTICES: Record<string, string> = {
   'admins-saved': 'Administrators saved.',
   imported: 'Configuration imported.',
   'updates-saved': 'Update checks saved.',
+  'method-saved': 'Saved.',
+  'method-started': 'Set up the new method below. The current one keeps working until you switch.',
+  'method-cancelled': 'The sign-in method was not changed.',
+  'method-expired': 'That change expired after an hour. Start again.',
+  'method-changed': 'Sign-in method changed. Everyone else signs in again with the new method.',
   'mcp-token-revoked': 'Token revoked. Clients using it can no longer connect.',
   'home-saved': 'Home page changed.',
   'update-available': 'A new version is available.',
@@ -333,7 +339,7 @@ export function mountAdminRoutes(app: Hono, deps: Deps): void {
     const out: Record<string, { source: SecretSource; envName?: string }> = {}
     if (!sink) return out
     const s = sink as unknown as Record<string, unknown>
-    const refs: Record<string, unknown> = { ...s, ...(s.via && typeof s.via === 'object' ? { apiKey: (s.via as Record<string, unknown>).apiKey } : {}) }
+    const refs: Record<string, unknown> = { ...s, ...(s.via && typeof s.via === 'object' ? s.via as Record<string, unknown> : {}) }
     for (const [key, value] of Object.entries(refs)) {
       const name = value && typeof value === 'object' && typeof (value as { $env?: unknown }).$env === 'string' ? (value as { $env: string }).$env : undefined
       if (!name) continue
@@ -411,7 +417,7 @@ export function mountAdminRoutes(app: Hono, deps: Deps): void {
     if (p instanceof Response) return p
     const name = c.req.param('name')
     try {
-      await sendSinkTest(name, p.config, deps.getEnv, deps.fetch, deps.cloudflareEmail)
+      await sendSinkTest(name, p.config, deps.getEnv, deps.fetch, deps)
       await appendAudit(deps.db, { actor: p.viewer.email, action: 'sink.test', target: `sink:${name}`, before: null, after: null, at: nowSeconds() })
       return done(c, '/admin/channels', 'test-sent')
     } catch (error) {
@@ -437,6 +443,8 @@ export function mountAdminRoutes(app: Hono, deps: Deps): void {
     if (error) return html(c, accessPage({ viewer: p.viewer, csrf: p.csrf, providerSummary: providerSummary(p.config), admins: p.config.access?.admins?.emails ?? [], values: formValues(p.form), error }), 400)
     return done(c, '/admin/access', 'admins-saved')
   })
+
+  mountAccessSwitch(app, deps, { view, post, html, done })
 
   // ── Import / export / activity ────────────────────────────────────────────────────────────
 
@@ -586,7 +594,7 @@ export function mountAdminRoutes(app: Hono, deps: Deps): void {
     if (!ok) return c.text('Unauthorized', 401, noStore)
     const name = c.req.param('name')
     try {
-      await sendSinkTest(name, await storedConfig(), deps.getEnv, deps.fetch, deps.cloudflareEmail)
+      await sendSinkTest(name, await storedConfig(), deps.getEnv, deps.fetch, deps)
       await appendAudit(deps.db, { actor: 'api-token', action: 'sink.test', target: `sink:${name}`, before: null, after: null, at: nowSeconds() })
       return c.json({ ok: true }, 200, noStore)
     } catch (error) {

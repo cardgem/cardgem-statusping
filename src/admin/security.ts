@@ -4,6 +4,7 @@ import { canAcknowledge, type Viewer } from '../auth/viewer.ts'
 import { type EnvGetter, type EnvRef, type NormalizedConfig, normalizeConfig, resolveConfigEnv, type StatusPingConfig } from '../config.ts'
 import type { Db } from '../db/types.ts'
 import { randomToken, sha256Hex, timingSafeEqual } from '../util/crypto.ts'
+import { TENANT_ENV, clampToTenantPolicy, explicitIntervalIds, parseTenantPolicy, tenantPolicyProblems } from '../platform.ts'
 
 /** Configuration accepted by the browser admin.  It is opt-in on purpose. */
 export type AdminConfig = StatusPingConfig & { admin?: boolean }
@@ -48,11 +49,18 @@ export function validateAdminSecrets(value: unknown): string[] {
         break
       case 'telegram': ref('botToken'); ref('chatId'); break
       case 'discord': ref('webhookUrl'); break
+      case 'teams': case 'googlechat': case 'mattermost': ref('webhookUrl'); break
+      case 'matrix': ref('accessToken'); break
+      case 'gotify': ref('token'); break
+      case 'pagerduty': ref('routingKey'); break
       case 'slack': ref('webhookUrl'); break
       case 'email': {
         const via = sink.via
         if (via && typeof via === 'object' && !Array.isArray(via) && (via as Record<string, unknown>).provider === 'resend') {
           envRef((via as Record<string, unknown>).apiKey, `sinks.${name}.via.apiKey`, problems)
+        }
+        if (via && typeof via === 'object' && !Array.isArray(via) && (via as Record<string, unknown>).provider === 'smtp' && (via as Record<string, unknown>).password !== undefined) {
+          envRef((via as Record<string, unknown>).password, `sinks.${name}.via.password`, problems)
         }
         break
       }
@@ -111,8 +119,12 @@ export interface AdminConfigValidation {
   normalized: NormalizedConfig
 }
 
-/** Validates a JSON-shaped admin config without resolving or returning secret values. */
-export function validateAdminConfig(value: unknown, getEnv: EnvGetter): AdminConfigValidation {
+/**
+ * Validates a JSON-shaped admin config without resolving or returning secret values. On a hosted
+ * tenant, a save over the plan's limits is rejected; loading an already-stored config instead
+ * fits it into the plan, so a downgrade never takes the site down.
+ */
+export function validateAdminConfig(value: unknown, getEnv: EnvGetter, mode: 'save' | 'load' = 'save'): AdminConfigValidation {
   const config = record(value)
   if (!config) throw new Error('config: must be an object')
   const admin = config.admin
@@ -122,10 +134,14 @@ export function validateAdminConfig(value: unknown, getEnv: EnvGetter): AdminCon
   try {
     // Environment-backed monitor URLs need a harmless placeholder during validation.  Their
     // actual value stays in the environment and is resolved only when the config becomes active.
-    return {
-      config: config as unknown as AdminConfig,
-      normalized: normalizeConfig(resolveConfigEnv(config as unknown as StatusPingConfig, getEnv, true)),
+    const normalized = normalizeConfig(resolveConfigEnv(config as unknown as StatusPingConfig, getEnv, true))
+    const tenant = parseTenantPolicy(getEnv(TENANT_ENV))
+    if (!tenant) return { config: config as unknown as AdminConfig, normalized }
+    if (mode === 'save') {
+      const overLimit = tenantPolicyProblems(normalized, tenant, explicitIntervalIds(config as unknown as StatusPingConfig))
+      if (overLimit.length) throw new Error(`Over your plan's limits:\n  - ${overLimit.join('\n  - ')}`)
     }
+    return { config: config as unknown as AdminConfig, normalized: clampToTenantPolicy(normalized, tenant) }
   } catch (error) {
     throw error instanceof Error ? error : new Error(String(error))
   }

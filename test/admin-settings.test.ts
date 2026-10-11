@@ -118,6 +118,31 @@ describe('admin Settings pages', () => {
     expect(await db.first(`SELECT name FROM instance_secrets WHERE name LIKE 'env:SINK_TEAM%'`)).toBeNull()
   })
 
+  it('saves an SMTP email channel with a write-only password', async () => {
+    const { b, db } = await signedIn()
+    await b.get('/admin/channels/new?type=email')
+    const base = { type: 'email', name: 'mail', to: 'ops@example.test', via: 'smtp', from: 'StatusPing <alerts@example.test>', smtpHost: 'smtp.example.test', smtpPort: '587', smtpSecurity: 'starttls', smtpUsername: 'alerts@example.test' }
+    expect((await b.post('/admin/channels/new', base)).body).toContain('Enter the SMTP password.')
+    expect((await b.post('/admin/channels/new', { ...base, smtpPort: '25', password: 'pw' })).body).toContain('Port 25 is blocked')
+    expect((await b.post('/admin/channels/new', { ...base, password: 'smtp-secret-pw' })).res.headers.get('location')).toBe('/admin/channels?notice=channel-added')
+    expect((await stored(db)).sinks!.mail).toEqual({ type: 'email', to: ['ops@example.test'], via: { provider: 'smtp', host: 'smtp.example.test', port: 587, security: 'starttls', username: 'alerts@example.test', password: { $env: 'SINK_MAIL_PASSWORD' }, from: 'StatusPing <alerts@example.test>' } })
+    const edit = await b.get('/admin/channels/mail')
+    expect(edit.body).toContain('Saved. Leave blank to keep it.')
+    expect(edit.body).not.toContain('smtp-secret-pw')
+    await b.post('/admin/channels/mail', { ...base, password: '' })
+    expect(((await stored(db)).sinks!.mail as { via: { password: unknown } }).via.password).toEqual({ $env: 'SINK_MAIL_PASSWORD' })
+  })
+
+  it('lists every channel type and saves a Matrix channel with a write-only token', async () => {
+    const { b, db } = await signedIn()
+    const channels = (await b.get('/admin/channels')).body
+    for (const type of ['teams', 'googlechat', 'mattermost', 'matrix', 'gotify', 'pagerduty']) expect(channels).toContain(`/admin/channels/new?type=${type}`)
+    await b.get('/admin/channels/new?type=matrix')
+    expect((await b.post('/admin/channels/new', { type: 'matrix', name: 'chat', homeserver: 'https://matrix.example.test', roomId: '!room:example.test', accessToken: 'syt_matrix_secret' })).res.headers.get('location')).toBe('/admin/channels?notice=channel-added')
+    expect((await stored(db)).sinks!.chat).toEqual({ type: 'matrix', homeserver: 'https://matrix.example.test', roomId: '!room:example.test', accessToken: { $env: 'SINK_CHAT_ACCESSTOKEN' } })
+    expect((await b.get('/admin/channels/chat')).body).not.toContain('syt_matrix_secret')
+  })
+
   it('refuses changes that lock the signed-in administrator out', async () => {
     const { b, db } = await signedIn()
     await b.get('/admin/access')

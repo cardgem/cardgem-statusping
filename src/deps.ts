@@ -1,3 +1,4 @@
+import type { SmtpConnector } from './notify/smtp.ts'
 import {
   type EnvGetter,
   type NormalizedConfig,
@@ -13,9 +14,10 @@ import type { TcpConnector } from './evaluate/tcp.ts'
 import type { ConfirmationProbe } from './confirmation.ts'
 import type { CloudflareEmailSender } from './notify/sinks.ts'
 import { loadAdminConfig, seedAdminConfig } from './admin/service.ts'
-import { loadSetupState } from './setup/state.ts'
+import { beginSetup, loadSetupState } from './setup/state.ts'
 import { validateAdminConfig } from './admin/security.ts'
 import { normalizeClientIp } from './rate-limit.ts'
+import { type TenantPolicy, TENANT_ENV, clampToTenantPolicy, parseTenantPolicy } from './platform.ts'
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error'
 export type Logger = (level: LogLevel, message: string, data?: Record<string, unknown>) => void
@@ -49,11 +51,15 @@ export interface Deps {
   location?: string
   /** Optional Cloudflare Email Routing binding adapter. */
   cloudflareEmail?: CloudflareEmailSender
+  /** Opens SMTP connections for email channels that use your own mail server. */
+  smtpConnect?: SmtpConnector
   log: Logger
   /** Runs a promise after the response is sent where the platform supports it. */
   waitUntil?: (p: Promise<unknown>) => void
   /** Adapter-owned resolver. Core never trusts forwarding headers itself. */
   clientIp: (request: Request) => string | null
+  /** Hosted tenant plan policy from STATUSPING_TENANT (plan 005); undefined when self-hosted. */
+  tenant?: TenantPolicy
 }
 
 export interface CreateDepsOptions {
@@ -67,6 +73,7 @@ export interface CreateDepsOptions {
   confirmationProbe?: ConfirmationProbe
   location?: string
   cloudflareEmail?: CloudflareEmailSender
+  smtpConnect?: SmtpConnector
   clientIp?: (request: Request) => string | null
 }
 
@@ -82,7 +89,10 @@ export function createDeps(opts: CreateDepsOptions): Deps {
   if (roleEnv !== 'primary' && roleEnv !== 'watchdog') {
     throw new Error(`STATUSPING_ROLE must be "primary" or "watchdog", got "${roleEnv}"`)
   }
-  const config = normalizeConfig(resolveConfigEnv(opts.config, opts.getEnv))
+  // Read from the real environment only: a tenant can never store or override its own policy.
+  const tenant = parseTenantPolicy(opts.getEnv(TENANT_ENV))
+  const normalized = normalizeConfig(resolveConfigEnv(opts.config, opts.getEnv))
+  const config = tenant ? clampToTenantPolicy(normalized, tenant) : normalized
   if (config.monitors.some((monitor) => monitor.escalation) && !opts.getEnv('ACK_SECRET')) {
     throw new Error('ACK_SECRET must be set when escalation is configured')
   }
@@ -108,8 +118,10 @@ export function createDeps(opts: CreateDepsOptions): Deps {
     confirmationProbe: opts.confirmationProbe,
     location: opts.location,
     cloudflareEmail: opts.cloudflareEmail,
+    smtpConnect: opts.smtpConnect,
     clientIp: opts.clientIp ?? (() => null),
     log: opts.log ?? consoleLogger,
+    tenant,
   }
   return deps
 }
@@ -143,7 +155,13 @@ async function loadStoredEnv(deps: Deps): Promise<void> {
  */
 export async function refreshAdminConfig(deps: Deps, now: number): Promise<boolean> {
   await loadStoredEnv(deps)
-  const setup = await loadSetupState(deps.db)
+  let setup = await loadSetupState(deps.db)
+  if (!setup && deps.tenant && deps.hasRealEnv('STATUSPING_SETUP_TOKEN')) {
+    // A freshly provisioned hosted tenant starts in the setup wizard; the owner claims it with
+    // the STATUSPING_SETUP_TOKEN the platform issued at sign-up (plan 005).
+    await beginSetup(deps.db, 'platform', now)
+    setup = await loadSetupState(deps.db)
+  }
   deps.setupPending = setup?.status === 'pending'
   if (deps.setupPending) return false
   if (setup?.status === 'complete') deps.adminEnabled = true
@@ -151,12 +169,12 @@ export async function refreshAdminConfig(deps: Deps, now: number): Promise<boole
   let stored = await loadAdminConfig(deps.db)
   if (!stored) {
     // Validate before persisting: literal credentials never enter admin_config or audit_log.
-    const validated = validateAdminConfig({ ...deps.configInput, admin: true }, deps.getEnv)
+    const validated = validateAdminConfig({ ...deps.configInput, admin: true }, deps.getEnv, 'load')
     await seedAdminConfig(deps.db, validated.config, 'config-seed', now)
     stored = await loadAdminConfig(deps.db)
   }
   if (!stored) throw new Error('admin config seed was not stored')
-  const validated = validateAdminConfig(stored.config, deps.getEnv)
+  const validated = validateAdminConfig(stored.config, deps.getEnv, 'load')
   deps.config = validated.normalized
   deps.configInput = validated.config
   return true
