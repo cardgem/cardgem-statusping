@@ -5,6 +5,7 @@ import {
   type Role,
   type StatusPingConfig,
   normalizeConfig,
+  parseJsonConfig,
   parsePingTokens,
   resolveConfigEnv,
 } from './config.ts'
@@ -13,7 +14,7 @@ import type { CertificateExpiryProvider } from './expiry/types.ts'
 import type { TcpConnector } from './evaluate/tcp.ts'
 import type { ConfirmationProbe } from './confirmation.ts'
 import type { CloudflareEmailSender } from './notify/sinks.ts'
-import { loadAdminConfig, seedAdminConfig } from './admin/service.ts'
+import { currentRevision, ensureBaselineRevision, loadAdminConfig, seedAdminConfig } from './admin/service.ts'
 import { beginSetup, loadSetupState } from './setup/state.ts'
 import { validateAdminConfig } from './admin/security.ts'
 import { normalizeClientIp } from './rate-limit.ts'
@@ -60,11 +61,32 @@ export interface Deps {
   clientIp: (request: Request) => string | null
   /** Hosted tenant plan policy from STATUSPING_TENANT (plan 005); undefined when self-hosted. */
   tenant?: TenantPolicy
+  /** The newest saved configuration revision (0 before the first). */
+  configRevision: number
+  /** What the last refreshAdminConfig() saw; an unchanged stamp skips reloading and re-validating. */
+  configStamp?: string
+  configLoaded: boolean
+  /** A deployed site: configured only through its database. */
+  fromDatabase: boolean
+  /** Reads an old statusping.config.ts, if the repository still has one (migration source only). */
+  legacyConfig?: () => Promise<StatusPingConfig | undefined>
 }
+
+/** What a site serves before setup or a migration has stored its configuration. */
+const UNCONFIGURED: StatusPingConfig = { title: 'StatusPing', baseUrl: 'http://localhost', groups: [] }
+
+/** The copy of a config-as-code site's configuration that v0.2.26/v0.2.27 saved; adopted once on first run. */
+export const LEGACY_CONFIG_KEY = 'legacy_config'
 
 export interface CreateDepsOptions {
   db: Db
-  config: StatusPingConfig
+  /**
+   * Tests only. A deployed site passes nothing and runs from its database: the setup wizard,
+   * Settings, and the YAML API are the only ways to configure it (plan 011).
+   */
+  config?: StatusPingConfig
+  /** Adapters pass a reader for an old statusping.config.ts; it is used once, to migrate. */
+  legacyConfig?: () => Promise<StatusPingConfig | undefined>
   getEnv: EnvGetter
   fetch?: typeof fetch
   log?: Logger
@@ -91,7 +113,8 @@ export function createDeps(opts: CreateDepsOptions): Deps {
   }
   // Read from the real environment only: a tenant can never store or override its own policy.
   const tenant = parseTenantPolicy(opts.getEnv(TENANT_ENV))
-  const normalized = normalizeConfig(resolveConfigEnv(opts.config, opts.getEnv))
+  const input = opts.config ?? UNCONFIGURED
+  const normalized = normalizeConfig(resolveConfigEnv(input, opts.getEnv))
   const config = tenant ? clampToTenantPolicy(normalized, tenant) : normalized
   if (config.monitors.some((monitor) => monitor.escalation) && !opts.getEnv('ACK_SECRET')) {
     throw new Error('ACK_SECRET must be set when escalation is configured')
@@ -102,8 +125,10 @@ export function createDeps(opts: CreateDepsOptions): Deps {
   const deps: Deps = {
     db: opts.db,
     config,
-    configInput: opts.config,
-    adminEnabled: opts.config.admin === true,
+    configInput: input,
+    adminEnabled: opts.config === undefined || opts.config.admin === true,
+    fromDatabase: opts.config === undefined,
+    legacyConfig: opts.legacyConfig,
     setupPending: false,
     role: roleEnv,
     // A Worker secret or env var always wins over a value stored by setup.
@@ -122,6 +147,8 @@ export function createDeps(opts: CreateDepsOptions): Deps {
     clientIp: opts.clientIp ?? (() => null),
     log: opts.log ?? consoleLogger,
     tenant,
+    configRevision: 0,
+    configLoaded: false,
   }
   return deps
 }
@@ -147,35 +174,110 @@ async function loadStoredEnv(deps: Deps): Promise<void> {
   deps.storedEnv = stored
 }
 
+/** One cheap read that changes whenever the configuration, setup state, or stored settings do. */
+async function configStamp(deps: Deps): Promise<{ stamp: string; revision: number }> {
+  const row = await deps.db.first<{ rev: number; setup: string | null; cfg: string | null; env: string }>(
+    `SELECT (SELECT COALESCE(MAX(id), 0) FROM config_revisions) AS rev,
+            (SELECT status || ':' || updated_at FROM setup_state WHERE id = 1) AS setup,
+            (SELECT updated_at || ':' || updated_by || ':' || length(config_json) FROM admin_config WHERE id = 1) AS cfg,
+            (SELECT COUNT(*) || ':' || COALESCE(MAX(created_at), 0) || ':' || COALESCE(SUM(length(value)), 0) FROM instance_secrets WHERE substr(name, 1, 4) = 'env:') AS env`,
+  )
+  return { stamp: JSON.stringify([row?.rev, row?.setup, row?.cfg, row?.env, deps.adminEnabled]), revision: row?.rev ?? 0 }
+}
+
 /**
- * Applies the instance's setup state, then loads the one DB-backed configuration when admin mode
- * is on: either `admin: true` in config-as-code, or a finished setup wizard. While setup is
- * pending, nothing is loaded. With neither, statusping.config.ts / STATUSPING_CONFIG stays
- * authoritative. Call after migrations, before work that reads `deps.config`.
+ * Applies the instance's setup state, then loads the configuration from the database. While setup
+ * is pending, nothing is loaded; a fresh database first adopts an old configuration or starts setup
+ * (see firstRun). Tests that inject a config without `admin: true` keep it as is. Call after migrations, before work that reads `deps.config`. Nothing is reloaded
+ * or re-validated while the revision, setup state and stored settings are unchanged.
  */
 export async function refreshAdminConfig(deps: Deps, now: number): Promise<boolean> {
+  const { stamp, revision } = await configStamp(deps)
+  if (stamp === deps.configStamp) return deps.configLoaded
+  deps.configRevision = revision
+  const loaded = await loadAdminState(deps, now)
+  deps.configLoaded = loaded.loaded
+  if (loaded.wrote) deps.configRevision = await currentRevision(deps.db)
+  // A refresh that wrote (a seed, a baseline revision) is read again next time.
+  deps.configStamp = loaded.wrote ? undefined : stamp
+  return loaded.loaded
+}
+
+/**
+ * v0.3 dropped config-as-code. On the first start of an empty database the site adopts, once, the
+ * copy v0.2.26/v0.2.27 saved, else an old statusping.config.ts still in the repository, else
+ * STATUSPING_CONFIG. No intermediate release is needed. The configuration keeps monitor
+ * IDs, history and ping URLs. With a sign-in method and administrators the site carries on as
+ * before; without, setup opens with the configuration already imported. Otherwise setup starts
+ * from scratch. Hosted tenants always start in setup (plan 005).
+ */
+async function firstRun(deps: Deps, now: number): Promise<void> {
+  let legacy: StatusPingConfig | undefined
+  if (!deps.tenant) {
+    const saved = (await deps.db.first<{ value: string }>(`SELECT value FROM instance_secrets WHERE name = ?`, [LEGACY_CONFIG_KEY]))?.value
+    try {
+      const raw = saved ? JSON.parse(saved)
+        : (await deps.legacyConfig?.().catch(() => undefined))
+          ?? (deps.hasRealEnv('STATUSPING_CONFIG') ? parseJsonConfig(deps.getEnv('STATUSPING_CONFIG')!) : undefined)
+      if (raw) legacy = validateAdminConfig({ ...raw, admin: true }, deps.getEnv, 'load').config
+    } catch (error) {
+      deps.log('warn', 'The old configuration could not be moved to the database; starting setup instead. Import it in the setup wizard after fixing it.', { problem: (error as Error).message })
+    }
+  }
+  if (!legacy) {
+    await beginSetup(deps.db, deps.tenant ? 'platform' : 'first-run', now)
+    return
+  }
+  const admins = legacy.access?.admins
+  if (legacy.access?.provider && (admins?.emails?.length || admins?.teams?.length)) {
+    await seedAdminConfig(deps.db, legacy, 'migration', now)
+    await deps.db.batch([
+      { sql: `INSERT INTO setup_state (id, status, code, session_key, draft_json, failed_attempts, previous_config_json, updated_at) VALUES (1, 'complete', NULL, NULL, '{}', 0, NULL, ?) ON CONFLICT(id) DO NOTHING`, params: [now] },
+      { sql: `INSERT INTO audit_log (actor, action, target, before_json, after_json, at) VALUES ('migration', 'config.migrate', 'config', NULL, NULL, ?)`, params: [now] },
+      { sql: `DELETE FROM instance_secrets WHERE name = ?`, params: [LEGACY_CONFIG_KEY] },
+    ])
+    deps.log('info', 'Moved the configuration from statusping.config.ts / STATUSPING_CONFIG into the database. Edit it in Settings from now on.')
+    return
+  }
+  await beginSetup(deps.db, 'migration', now)
+  const draft = { imported: legacy, title: legacy.title, description: legacy.description, baseUrl: legacy.baseUrl, timezone: legacy.timezone }
+  await deps.db.batch([
+    { sql: `UPDATE setup_state SET draft_json = ? WHERE id = 1`, params: [JSON.stringify(draft)] },
+    { sql: `DELETE FROM instance_secrets WHERE name = ?`, params: [LEGACY_CONFIG_KEY] },
+  ])
+  deps.log('info', 'The old configuration has no administrators. Open /setup to choose how to sign in; your monitors are already imported.')
+}
+
+async function loadAdminState(deps: Deps, now: number): Promise<{ loaded: boolean; wrote: boolean }> {
   await loadStoredEnv(deps)
   let setup = await loadSetupState(deps.db)
-  if (!setup && deps.tenant && deps.hasRealEnv('STATUSPING_SETUP_TOKEN')) {
-    // A freshly provisioned hosted tenant starts in the setup wizard; the owner claims it with
-    // the STATUSPING_SETUP_TOKEN the platform issued at sign-up (plan 005).
-    await beginSetup(deps.db, 'platform', now)
+  let wrote = false
+  if (!setup && deps.fromDatabase && !(await loadAdminConfig(deps.db))) {
+    // First run of this database: adopt a config-as-code site's configuration, or start setup.
+    // (A site configured with `admin: true` before setup existed has a config row and no setup row.)
+    await firstRun(deps, now)
     setup = await loadSetupState(deps.db)
+    wrote = true
   }
   deps.setupPending = setup?.status === 'pending'
-  if (deps.setupPending) return false
+  if (deps.setupPending) return { loaded: false, wrote }
   if (setup?.status === 'complete') deps.adminEnabled = true
-  if (!deps.adminEnabled) return false
+  if (!deps.adminEnabled) return { loaded: false, wrote }
   let stored = await loadAdminConfig(deps.db)
   if (!stored) {
     // Validate before persisting: literal credentials never enter admin_config or audit_log.
     const validated = validateAdminConfig({ ...deps.configInput, admin: true }, deps.getEnv, 'load')
     await seedAdminConfig(deps.db, validated.config, 'config-seed', now)
     stored = await loadAdminConfig(deps.db)
+    wrote = true
   }
   if (!stored) throw new Error('admin config seed was not stored')
+  if (deps.configRevision === 0) {
+    await ensureBaselineRevision(deps.db)
+    wrote = true
+  }
   const validated = validateAdminConfig(stored.config, deps.getEnv, 'load')
   deps.config = validated.normalized
   deps.configInput = validated.config
-  return true
+  return { loaded: true, wrote }
 }

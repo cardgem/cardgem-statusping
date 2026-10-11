@@ -11,10 +11,10 @@ The Deploy Button opens Cloudflare's GitHub deployment flow. Review the requeste
 For a manual deployment:
 
 1. Create a D1 database and replace the placeholder `database_id` in `wrangler.toml`.
-2. Export a configuration to `STATUSPING_CONFIG` and set `PING_TOKENS` plus any notification or sign-in secrets with `wrangler secret put`.
-3. Run `npm run cf:deploy`.
+2. Run `npm run cf:deploy`.
+3. Open the site. It starts in the setup wizard: claim it with the setup code from Workers Logs (or a `STATUSPING_SETUP_TOKEN` secret you set), choose how administrators sign in, and add monitors, alert channels, or a YAML file.
 
-The Worker creates its schema on the first request or scheduled tick. The included cron trigger runs every minute.
+No configuration file ships with StatusPing: everything lives in the site's database and is changed in Settings, as YAML, or through the API. The Worker creates its schema on the first request or scheduled tick. The included cron trigger runs every minute.
 
 `/healthz` reports the running app version, schema version, release channel, template version, and (if set) an opaque `STATUSPING_INSTANCE_ID`. These values are deliberately public deployment metadata: do not use a secret for the instance ID. `STATUSPING_TEMPLATE_VERSION` is a release-managed marker for future upgrade tooling; leave it unchanged in normal deployments.
 
@@ -28,8 +28,9 @@ template, canonical source, and file-ownership contract used by
 - **Updater-owned:** the runtime, adapters, scripts, package metadata, CI,
   tests, release marker, and this README outside its marked local-notes region.
   A supported upgrade may replace only these paths.
-- **Customer-owned:** `statusping.config.ts`, `wrangler.toml`, and `.dev.vars`.
-  Upgrade tooling must not replace them. Its sole documented exception is the
+- **Customer-owned:** `wrangler.toml` and `.dev.vars` (and an old `statusping.config.ts`,
+  which v0.3.0 no longer reads; upgrades leave it in place and list it). Upgrade
+  tooling must not replace them. Its sole documented exception is the
   public `STATUSPING_TEMPLATE_VERSION` line in `wrangler.toml`.
 - **Secrets and data:** secrets stay in Cloudflare/your local `.dev.vars`; D1
   data, Cloudflare resources, domains, and monitor configuration are never
@@ -60,13 +61,14 @@ npm run upgrade -- 0.2.0     # or a specific release
 
 The command fetches your installed release and the target release from
 `getstatusping/statusping`, then commits the upgrade on a new
-`statusping/upgrade-vX.Y.Z` branch. It changes only updater-owned files you
-have not edited, removes files the release deleted, carries your README local
-notes across, and updates only the `STATUSPING_TEMPLATE_VERSION` line in
-`wrangler.toml`. It never pushes. Review the commit, push the branch, and merge
-it through a pull request; Cloudflare deploys the merge, and `/healthz` then
-reports the new version. To roll back the code, revert that pull request;
-database migrations are forward-only and are never rolled back.
+`statusping/upgrade-vX.Y.Z` branch. It updates updater-owned files, merges the
+release into files you edited when the changes touch different lines, removes
+files the release deleted, carries your README local notes across, and updates
+only the `STATUSPING_TEMPLATE_VERSION` line in `wrangler.toml`. It never pushes.
+Review the commit, push the branch, and merge it through a pull request;
+Cloudflare deploys the merge, and `/healthz` then reports the new version. To
+roll back the code, revert that pull request; database migrations are
+forward-only and are never rolled back.
 
 If your Cloudflare project builds non-production branches, its preview build
 for the upgrade branch fails unless `wrangler.toml` has a `[previews]` block.
@@ -83,10 +85,11 @@ git clone --depth 1 https://github.com/getstatusping/statusping.git /tmp/statusp
 node /tmp/statusping-latest/scripts/upgrade.ts --adopt
 ```
 
-If you edited an updater-owned file, the command lists it and stops. Restore
+If your edits and the release change the same lines of an updater-owned file,
+the command lists it and stops. Restore
 the file, or rerun with `--skip-conflicts` to upgrade everything else and merge
-that file by hand. Upstream changes to your own files (`statusping.config.ts`,
-`wrangler.toml`) are listed for you to apply; they are never overwritten.
+that file by hand. Upstream changes to your own files (`wrangler.toml`) are
+listed for you to apply; they are never overwritten.
 
 ### If an upgrade goes wrong
 
@@ -128,13 +131,29 @@ Checks are off by default, so an installation never contacts GitHub unless an op
 
 This repository is self-contained: the shared UI is included as a local dependency, so the Deploy Button does not fetch any StatusPing package from npm.
 
+## Coming from config-as-code
+
+Since v0.3 the configuration lives in the database. A site configured by `statusping.config.ts` or `STATUSPING_CONFIG` can update straight to the latest release: on first start it moves that configuration into the database by itself. See [MIGRATING-TO-YAML.md](MIGRATING-TO-YAML.md).
+
 ## Manage configuration in the app
 
-To enable the browser admin, include `admin: true` in the initial configuration and configure an administrator under `access.admins` plus a supported sign-in provider. After that first deployment, sign in at `/admin` to edit or import the configuration as YAML.
+Sign in at `/admin`. Settings edits monitors, status pages, alert channels and access; **Settings → Configuration** exports and imports the whole configuration as YAML.
 
-Every YAML import is parsed as safe plain data, validated by the same StatusPing configuration schema used by code-based configuration, and checked for admin safety rules before it is saved. Invalid files leave the active configuration unchanged. Secrets stay in Cloudflare/Node environment variables: YAML may reference them with `$env: SECRET_NAME`, but never contains their values.
+Every YAML import is parsed as safe plain data, validated by the StatusPing configuration schema, and checked for admin safety rules before it is saved. Invalid files leave the active configuration unchanged. Secrets stay in Cloudflare/Node environment variables or are saved write-only in Settings: YAML may reference them with `$env: SECRET_NAME`, but never contains their values.
 
-When browser admin is enabled, the validated D1-backed configuration becomes the running configuration. The checked-in configuration or `STATUSPING_CONFIG` remains the initial seed and is still the recommended approach for automated or version-controlled deployments.
+Credentials are named, never written: webhook URLs and header values, HTTP monitor URLs and header values, and every channel credential accept `{ $env: NAME }`. A literal URL or header that carries a credential is refused. **Settings → Configuration** lists every `$env` name the configuration uses and whether it is set.
+
+Every save is kept as a version (the newest 50). **Configuration → History** shows who changed what, a line diff against the current version, and **Restore**. If someone else saved after you opened a page, your save is refused with a note instead of overwriting their change. Exported YAML starts with a `# yaml-language-server: $schema=…` line pointing at `/admin/schema.json` ([`statusping.schema.json`](statusping.schema.json), generated from the config types with `npm run schema:generate`), so editors validate and complete it. Validation errors name the line.
+
+Automation uses the same API with `ADMIN_TOKEN`: `GET /api/admin/config` returns JSON, or YAML with `Accept: application/yaml`, and an `ETag` with the revision; `PUT` accepts either, and with `If-Match: "<revision>"` it answers 412 when the configuration changed since. From a checkout:
+
+```bash
+npm run cli -- config check statusping.yaml                         # validate offline
+ADMIN_TOKEN=… npm run cli -- config pull --url https://status.example.com > statusping.yaml
+ADMIN_TOKEN=… npm run cli -- config push --url https://status.example.com --revision 12 statusping.yaml
+```
+
+Scheduled jobs no longer need `PING_TOKENS`: adding one in Settings (or through MCP) shows its ping URL once, and Settings → Monitors marks any job that has none yet.
 
 ## Change the sign-in method
 
@@ -149,7 +168,7 @@ With the browser admin enabled, StatusPing is also a remote [MCP](https://modelc
 - **Manage monitors**: `add_monitor`, `update_monitor`, `delete_monitor`, `rotate_ping_url`, `add_maintenance`, `delete_maintenance`.
 - **Manage status pages**: `add_status_page`, `update_status_page`, `delete_status_page`, `set_home_page`.
 - **Manage alert channels**: `list_channels`, `add_channel`, `update_channel`, `delete_channel`, `test_channel` (credentials are write-only).
-- **Manage settings**: `get_settings`, `update_settings`, `set_administrators`, `check_for_updates`, `get_configuration`, `import_configuration` (previews unless `apply: true`), `get_activity`.
+- **Manage settings**: `get_settings`, `update_settings`, `set_administrators`, `check_for_updates`, `get_configuration`, `import_configuration` (previews unless `apply: true`; pass the `revision` from `get_configuration` so a change made in between is not overwritten), `get_activity`.
 
 Resetting the site, changing the sign-in method and creating MCP tokens stay in the browser.
 
@@ -182,12 +201,27 @@ you create in the browser:
    - **OpenID Connect:** register StatusPing with Google, Microsoft Entra ID, Okta, Auth0,
      Keycloak, Pocket ID or another provider, save its client ID and secret (in the wizard, or as
      the Worker secrets `OIDC_CLIENT_ID` and `OIDC_CLIENT_SECRET`), and run a test sign-in.
-5. Describe the site and optionally add a first monitor. **Finish** saves the configuration and
-   signs you in to `/admin`; checks start on the next minute.
+5. Describe the site, then optionally add a first monitor and an alert channel (with **Send
+   test**), or **import** a YAML file exported from another StatusPing site. An import keeps the
+   sign-in method and site basics you chose; monitor ids, and with them their history, carry
+   over. **Finish** saves the configuration and signs you in to `/admin`; checks start on the
+   next minute.
 6. Remove the `STATUSPING_RESET_TOKEN` secret. Without it, `/setup/reset` does not exist.
 
-After setup, the configuration lives in the database and is edited as YAML in `/admin`;
-`statusping.config.ts` is no longer used. Passwords chosen in the wizard are stored as
+Scripts can do steps 3–5 in one call: `POST /api/setup` with JSON `{ "code": "<setup code>",
+"admin": "you@example.com", "yaml": "<configuration>" }`. The sign-in method comes from the
+YAML's `access.provider` (email + password when absent; the response then contains a generated
+password, shown once). Cloudflare Access needs `CF_ACCESS_AUD`, and OpenID Connect needs
+`OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET` and a reachable issuer, before the call.
+
+**Locked out?** Set the `STATUSPING_RECOVERY_TOKEN` secret, open `/setup/recover`, and enter
+it with an administrator's email. That session can only change the sign-in method (Settings →
+Access); everything else stays closed until you switch, and the recovery is recorded in
+Activity. Remove the secret afterwards. On Node, `npm run cli -- recover you@example.com`
+switches the site to email + password and prints a new password.
+
+After setup, the configuration lives in the database and is edited in Settings or as YAML.
+Passwords chosen in the wizard are stored as
 PBKDF2-SHA256 (50,000 iterations, which fits the Workers free plan's CPU limit), and password
 sign-in is limited to 10 attempts per minute per address.
 
@@ -222,6 +256,8 @@ Node 22.18+ can run StatusPing outside Cloudflare, which is useful for a watchdo
 npm install
 PORT=8000 STATUSPING_LOCATION='Portland, US' npm run dev
 ```
+
+On first start it opens the setup wizard at `/setup`; the setup code is printed in the terminal.
 
 For a real second vantage point, run a second Node instance on an independently operated network and give both instances the same monitor IDs and target configuration. On each instance set a unique, truthful `STATUSPING_LOCATION`, the same random `STATUSPING_CONFIRMATION_SECRET`, and peer URLs:
 

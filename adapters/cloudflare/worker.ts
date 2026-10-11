@@ -1,7 +1,6 @@
-import fileConfig from '../../statusping.config.ts'
-import { selectConfig } from '../../src/config.ts'
 import { type D1DatabaseLike, D1Db } from '../../src/db/d1.ts'
 import { type Deps, createDeps } from '../../src/deps.ts'
+import type { StatusPingConfig } from '../../src/config.ts'
 import { tick } from '../../src/tick.ts'
 import { createApp } from '../../src/web/app.ts'
 import { cloudflareTcpConnect } from './tcp.ts'
@@ -9,6 +8,16 @@ import { cloudflareEmailSender } from './email.ts'
 import { cloudflareSmtpConnect } from './smtp.ts'
 import { cloudflareConfirmationProbe, RegionalProbe, type DurableObjectNamespaceLike } from './confirmation.ts'
 import { normalizeClientIp } from '../../src/rate-limit.ts'
+
+/**
+ * A repository from before v0.3 may still have statusping.config.ts. It is read only on the first
+ * start of an empty database, to move its configuration in. The variable part keeps the import
+ * optional: the bundler includes the file when it exists and builds fine when it does not.
+ */
+async function legacyConfig(): Promise<StatusPingConfig | undefined> {
+  const suffix = '.config'
+  return ((await import(`../../statusping${suffix}.ts`)) as { default?: StatusPingConfig }).default
+}
 
 interface Env {
   DB: D1DatabaseLike
@@ -36,16 +45,12 @@ function init(env: Env) {
   if (!instance) {
     const deps = createDeps({
       db: new D1Db(env.DB),
-      // A release template can provide a config module whose default export is undefined;
-      // then this selects the per-instance JSON binding. A real config file wins everywhere.
-      config: selectConfig(fileConfig, (name) => {
-        const v = env[name]
-        return typeof v === 'string' ? v : undefined
-      }),
+      // No configuration ships with the Worker: it lives in D1 and is set up at /setup.
       getEnv: (name) => {
         const v = env[name]
         return typeof v === 'string' ? v : undefined
       },
+      legacyConfig,
       tcpConnect: cloudflareTcpConnect,
       smtpConnect: cloudflareSmtpConnect,
       confirmationProbe: env.REGIONAL_PROBE ? cloudflareConfirmationProbe(env.REGIONAL_PROBE) : undefined,

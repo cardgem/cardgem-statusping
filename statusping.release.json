@@ -1,7 +1,7 @@
 {
   "format": "statusping-template/v1",
-  "release": "0.2.22",
-  "template": "0.2.22",
+  "release": "0.3.2",
+  "template": "0.3.2",
   "channel": "stable",
   "source": {
     "repository": "https://github.com/getstatusping/statusping",
@@ -18,10 +18,12 @@
       "src/",
       "test/",
       "LICENSE",
+      "MIGRATING-TO-YAML.md",
       "README.md",
       "package-lock.json",
       "package.json",
       "statusping.release.json",
+      "statusping.schema.json",
       "tsconfig.json",
       "vitest.config.ts"
     ],
@@ -31,7 +33,8 @@
       "wrangler.toml"
     ],
     "optionalCustomerOwnedPaths": [
-      ".dev.vars"
+      ".dev.vars",
+      "statusping.config.ts"
     ],
     "updaterOwnedWranglerBindings": [
       "STATUSPING_TEMPLATE_VERSION"

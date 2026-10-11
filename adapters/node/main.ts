@@ -8,13 +8,23 @@
 import { createClient } from '@libsql/client'
 import { LibsqlDb } from '../../src/db/libsql.ts'
 import { createDeps } from '../../src/deps.ts'
-import { loadNodeConfig } from './config.ts'
+import type { StatusPingConfig } from '../../src/config.ts'
 import { lookupNodeCertificateExpiry } from './expiry.ts'
 import { nodeTcpConnect } from './tcp.ts'
 import { nodeSmtpConnect } from './smtp.ts'
 import { startNodeServer } from './server.ts'
 import { normalizeClientIp } from '../../src/rate-limit.ts'
 import { nodeConfirmationProbe, nodeConfirmationSettings } from './confirmation.ts'
+
+/**
+ * A repository from before v0.3 may still have statusping.config.ts. It is read only on the first
+ * start of an empty database, to move its configuration in. The variable part keeps the import
+ * optional: the bundler includes the file when it exists and builds fine when it does not.
+ */
+async function legacyConfig(): Promise<StatusPingConfig | undefined> {
+  const suffix = '.config'
+  return ((await import(`../../statusping${suffix}.ts`)) as { default?: StatusPingConfig }).default
+}
 
 const env = (name: string) => process.env[name] || undefined
 const confirmation = nodeConfirmationSettings(env)
@@ -23,8 +33,8 @@ const deps = createDeps({
   db: new LibsqlDb(
     createClient({ url: env('TURSO_DATABASE_URL') ?? 'file:statusping.db', authToken: env('TURSO_AUTH_TOKEN') }),
   ),
-  config: await loadNodeConfig(env),
   getEnv: env,
+  legacyConfig,
   certificateExpiry: lookupNodeCertificateExpiry,
   tcpConnect: nodeTcpConnect,
   smtpConnect: nodeSmtpConnect,
