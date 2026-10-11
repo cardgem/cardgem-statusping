@@ -1,25 +1,57 @@
 /** Build a checksummed, config-only Cloudflare Worker release artifact. */
-import { createHash } from 'node:crypto'
+import { createHash, createPrivateKey, sign } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { cp, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import packageJson from '../package.json' with { type: 'json' }
 import { MIGRATIONS } from '../src/schema.ts'
+import { canonicalJson } from '../src/updates.ts'
+import { appRoot, releaseDir, wrangler } from './release-paths.ts'
 
-const appRoot = dirname(dirname(fileURLToPath(import.meta.url)))
-const workspaceRoot = dirname(dirname(appRoot))
 const version = packageJson.version
-const outputDir = join(workspaceRoot, 'dist', 'releases', version)
+const outputDir = releaseDir(version)
 const stagingDir = `${outputDir}.tmp`
 const bundleName = `statusping-cloudflare-${version}.js`
-const wrangler = process.platform === 'win32'
-  ? join(workspaceRoot, 'node_modules', '.bin', 'wrangler.cmd')
-  : join(workspaceRoot, 'node_modules', '.bin', 'wrangler')
 
 function sha256(content: Uint8Array): string {
   return createHash('sha256').update(content).digest('hex')
+}
+
+/**
+ * Do not use the wall clock in a release artifact: rebuilding the same source
+ * must produce the same update metadata. A release job can provide
+ * SOURCE_DATE_EPOCH; local builds use the checked-out commit timestamp.
+ */
+function releasedAt(): string {
+  const sourceDateEpoch = process.env.SOURCE_DATE_EPOCH
+  if (sourceDateEpoch && /^\d+$/.test(sourceDateEpoch)) {
+    const date = new Date(Number(sourceDateEpoch) * 1_000)
+    if (!Number.isNaN(date.valueOf())) return date.toISOString()
+  }
+  const result = spawnSync('git', ['log', '-1', '--format=%cI'], { cwd: appRoot, encoding: 'utf8' })
+  const date = new Date(result.stdout.trim())
+  if (!Number.isNaN(date.valueOf())) return date.toISOString()
+  throw new Error('Unable to determine a reproducible release timestamp; set SOURCE_DATE_EPOCH')
+}
+
+/**
+ * A release bundle is public. The release worker deliberately reads all
+ * credentials at runtime, but guard against a future bundler/config mistake
+ * by rejecting any artifact containing a secret value supplied to this build.
+ * Only values are scanned; an error names the environment key, never its value.
+ */
+function assertNoBuildSecrets(files: Record<string, Uint8Array>) {
+  const candidates = Object.entries(process.env).filter(([name, value]) =>
+    /(?:secret|token|password|api[_-]?key|credential|private[_-]?key|signing[_-]?key)/i.test(name) && (value?.length ?? 0) >= 8,
+  ) as [string, string][]
+  for (const [name, value] of candidates) {
+    for (const [file, bytes] of Object.entries(files)) {
+      if (Buffer.from(bytes).includes(Buffer.from(value))) {
+        throw new Error(`Release artifact ${file} contains a value from ${name}; aborting before publication`)
+      }
+    }
+  }
 }
 
 function migrationsSql(): string {
@@ -81,11 +113,55 @@ async function main() {
   }
   await writeFile(join(stagingDir, 'metadata.json'), `${JSON.stringify(metadata, null, 2)}\n`, 'utf8')
 
-  const fileNames = [bundleName, 'migrations.sql', 'metadata.json']
-  const files = Object.fromEntries(await Promise.all(fileNames.map(async (name) => {
-    const bytes = await readFile(join(stagingDir, name))
+  const artifactContents = Object.fromEntries(await Promise.all([bundleName, 'migrations.sql', 'metadata.json'].map(async (name) => [name, await readFile(join(stagingDir, name))]))) as Record<string, Uint8Array>
+  const checksum = (name: string) => {
+    const bytes = artifactContents[name]!
+    return { sha256: sha256(bytes), bytes: bytes.byteLength }
+  }
+  const updateManifest: Record<string, unknown> = {
+    format: 'statusping-update-manifest/v1',
+    version,
+    channel: 'stable',
+    releasedAt: releasedAt(),
+    // The oldest installed release that can move straight to this one. Raise
+    // it in package.json when a release drops an upgrade path.
+    minimumVersion: packageJson.statusping.minimumUpgradeVersion,
+    schema: {
+      from: 0,
+      to: MIGRATIONS.length,
+      strategy: 'forward-only',
+    },
+    bundle: { file: bundleName, ...checksum(bundleName) },
+    migrations: { file: 'migrations.sql', ...checksum('migrations.sql') },
+    template: {
+      version,
+      marker: 'STATUSPING_TEMPLATE_VERSION',
+    },
+    notesUrl: `https://github.com/getstatusping/statusping/releases/tag/v${version}`,
+    breaking: false,
+  }
+  // Signing is deliberately release-job-only. The public key is configured by an
+  // operator on instances that opt into update checks; no private key enters this
+  // repository or a public bundle. An unsigned local artifact remains useful for
+  // deployment testing, but the in-app checker will refuse to offer it.
+  const signingKey = process.env.STATUSPING_RELEASE_SIGNING_KEY
+  if (process.env.STATUSPING_REQUIRE_RELEASE_SIGNATURE === 'true' && !signingKey) {
+    throw new Error('STATUSPING_RELEASE_SIGNING_KEY is required when STATUSPING_REQUIRE_RELEASE_SIGNATURE=true')
+  }
+  if (signingKey) {
+    const key = createPrivateKey({ key: Buffer.from(signingKey, 'base64'), format: 'der', type: 'pkcs8' })
+    const signature = sign(null, Buffer.from(canonicalJson(updateManifest)), key).toString('base64')
+    updateManifest.signature = { algorithm: 'Ed25519', value: signature }
+  }
+  artifactContents['update-manifest.json'] = Buffer.from(`${JSON.stringify(updateManifest, null, 2)}\n`)
+  await writeFile(join(stagingDir, 'update-manifest.json'), artifactContents['update-manifest.json']!)
+  assertNoBuildSecrets(artifactContents)
+
+  const fileNames = [bundleName, 'migrations.sql', 'metadata.json', 'update-manifest.json']
+  const files = Object.fromEntries(fileNames.map((name) => {
+    const bytes = artifactContents[name]!
     return [name, { sha256: sha256(bytes), bytes: bytes.byteLength }]
-  })))
+  }))
   const manifest = { version, files }
   await writeFile(join(stagingDir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8')
 

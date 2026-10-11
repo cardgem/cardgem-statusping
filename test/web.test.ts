@@ -3,7 +3,7 @@ import { type StatusPingConfig, normalizeConfig } from '../src/config.ts'
 import { tick } from '../src/tick.ts'
 import { createApp } from '../src/web/app.ts'
 import { loadStatusData } from '../src/web/data.ts'
-import { APP_VERSION } from '../src/version.ts'
+import { APP_VERSION, SCHEMA_VERSION } from '../src/version.ts'
 import { normalizeClientIp } from '../src/rate-limit.ts'
 import { type CountingDb, TEST_TOKENS, createTestDb, fakeFetch, makeDeps, testConfig } from './helpers.ts'
 
@@ -297,7 +297,10 @@ describe('HTTP routes (no sign-in configured)', () => {
     const data = await loadStatusData(deps, now, ['site'])
     const site = data.groups[0]!.monitors[0]!
     expect(site.uptime24h).toBe(1)
-    expect(site.bars.at(-1)!.maintenance).toHaveLength(3)
+    // The clock may be just after midnight, so a window can live in the
+    // preceding day bar or be split across two bars. All three source windows
+    // must still render.
+    expect(new Set(site.bars.flatMap((bar) => bar.maintenance.map((window) => window.title)))).toEqual(new Set(['Database migration', 'Network work', 'Live deploy']))
     expect(data.activeMaintenance).toEqual(expect.arrayContaining([expect.objectContaining({ title: 'Live deploy' })]))
 
     // Use a distinct request URL so this public response cannot be a 30-second edge-cache
@@ -334,7 +337,7 @@ describe('HTTP routes (no sign-in configured)', () => {
 
   it('healthz and POST /tick', async () => {
     const off = await setup()
-    expect(await (await off.app.request('/healthz')).json()).toMatchObject({ ok: true, version: APP_VERSION, role: 'primary' })
+    expect(await (await off.app.request('/healthz')).json()).toMatchObject({ ok: true, version: APP_VERSION, schemaVersion: SCHEMA_VERSION, channel: 'stable', templateVersion: APP_VERSION, instanceId: null, role: 'primary' })
     expect((await off.app.request('/tick', { method: 'POST' })).status).toBe(404)
     await close()
     const on = await setup({ env: { TICK_SECRET: 's3cret-value' } })
@@ -355,7 +358,8 @@ describe('bar popovers', () => {
     const now = Math.floor(Date.now() / 1000)
     await tick(deps, (now - 100 * 86400) * 1000) // monitors exist for 100 days
     const add = (id: string, reason: string, detail: string, daysAgo: number, minutes: number | null) => {
-      const start = now - daysAgo * 86400
+      // Keep short test outages away from midnight so their daily aggregate is deterministic.
+      const start = now - daysAgo * 86400 - 12 * 3600
       return db.run(`INSERT INTO incidents (monitor_id, reason, detail, started_at, resolved_at) VALUES (?, ?, ?, ?, ?)`, [
         id, reason, detail, start, minutes === null ? null : start + minutes * 60,
       ])

@@ -6,13 +6,14 @@ import { acknowledgeIncident, verifyAcknowledgeToken } from '../acknowledgements
 import type { NormalizedPage } from '../config.ts'
 import type { Deps } from '../deps.ts'
 import { dispatchNotifications } from '../notify/dispatch.ts'
+import { dispatchAnnouncementNotifications, enqueueAnnouncementNotifications } from '../notify/announcements.ts'
 import { MAX_PING_BODY, handlePing, parseSignal } from '../ping.ts'
 import { ensureSchema } from '../schema.ts'
 import { tick } from '../tick.ts'
 import { timingSafeEqual } from '../util/crypto.ts'
 import { createAnnouncement, listAnnouncements, parseAnnouncementCreate, parseAnnouncementPatch, patchAnnouncement } from '../announcements.ts'
 import { nowSeconds } from '../util/time.ts'
-import { APP_VERSION } from '../version.ts'
+import { APP_VERSION, SCHEMA_VERSION } from '../version.ts'
 import { type StatusData, lastTickAt, loadMonitorDetail, loadStatusData } from './data.ts'
 import { buildChrome } from './chrome.ts'
 import { renderBadge } from './badge.ts'
@@ -21,6 +22,8 @@ import { confirmSubscription, consumeSubscribeLimit, dispatchSubscriberOutbox, e
 import { refreshAdminConfig } from '../deps.ts'
 import { mountAdminRoutes } from '../admin/routes.ts'
 import { consumePingRateLimit } from '../rate-limit.ts'
+import { runHttpCheck } from '../evaluate/http.ts'
+import { runTcpCheck } from '../evaluate/tcp.ts'
 
 const STALE_TICK_SECONDS = 180
 const PUBLIC_MAX_AGE = 30
@@ -129,11 +132,20 @@ export function createApp(deps: Deps): Hono {
       const last = await lastTickAt(deps)
       const lag = last === null ? null : now - last
       const ok = lag !== null && lag <= STALE_TICK_SECONDS
-      return c.json({ ok, version: APP_VERSION, role: deps.role, lastTickAt: last, lagSeconds: lag }, ok ? 200 : 503, {
+      // These are intentionally public, non-secret deployment facts. They let an
+      // operator (and a future update-review flow) identify compatibility without
+      // disclosing configuration or credentials.
+      const channel = deps.getEnv('STATUSPING_RELEASE_CHANNEL') ?? 'stable'
+      const instanceId = deps.getEnv('STATUSPING_INSTANCE_ID') ?? null
+      const templateVersion = deps.getEnv('STATUSPING_TEMPLATE_VERSION') ?? APP_VERSION
+      return c.json({ ok, version: APP_VERSION, schemaVersion: SCHEMA_VERSION, channel, templateVersion, instanceId, role: deps.role, lastTickAt: last, lagSeconds: lag }, ok ? 200 : 503, {
         'cache-control': 'no-store',
+        // Public, credential-free facts: let statusp.ing/updates read them
+        // directly from the operator's browser.
+        'access-control-allow-origin': '*',
       })
     } catch (e) {
-      return c.json({ ok: false, error: (e as Error).message }, 503)
+      return c.json({ ok: false, error: 'health check failed' }, 503, { 'access-control-allow-origin': '*' })
     }
   })
 
@@ -143,6 +155,29 @@ export function createApp(deps: Deps): Hono {
     const auth = c.req.header('authorization') ?? ''
     if (!timingSafeEqual(auth, `Bearer ${secret}`)) return c.text('Unauthorized', 401)
     return c.json(await tick(deps))
+  })
+
+  // A self-hosted Node peer can ask this instance to repeat a configured HTTP
+  // or TCP check. Requests carry only a monitor id, never the target or its
+  // credentials: this instance resolves both from its own local config.
+  app.post('/internal/confirm', async (c) => {
+    const secret = deps.getEnv('STATUSPING_CONFIRMATION_SECRET')
+    if (!secret || !deps.location) return c.text('Not found', 404)
+    if (!timingSafeEqual(c.req.header('authorization') ?? '', `Bearer ${secret}`)) return c.text('Unauthorized', 401, { 'cache-control': 'no-store' })
+    const length = Number(c.req.header('content-length') ?? 0)
+    if (!Number.isFinite(length) || length > 1024) return c.text('Bad request', 400, { 'cache-control': 'no-store' })
+    let body: unknown
+    try { body = await c.req.json() } catch { return c.text('Bad request', 400, { 'cache-control': 'no-store' }) }
+    const monitorId = body && typeof body === 'object' && !Array.isArray(body) ? (body as Record<string, unknown>).monitorId : undefined
+    if (typeof monitorId !== 'string' || monitorId.length > 120) return c.text('Bad request', 400, { 'cache-control': 'no-store' })
+    const monitor = config.monitors.find((item) => item.id === monitorId)
+    if (!monitor || (monitor.kind !== 'http' && monitor.kind !== 'tcp')) return c.text('Not found', 404, { 'cache-control': 'no-store' })
+    const result = monitor.kind === 'http'
+      ? await runHttpCheck(monitor, deps.fetch)
+      : deps.tcpConnect
+        ? await runTcpCheck(monitor, deps.tcpConnect)
+        : { ok: false, err: 'TCP checks are not configured in this runtime' }
+    return c.json({ location: deps.location, ok: result.ok, err: result.err }, 200, { 'cache-control': 'no-store' })
   })
 
   // ── Management API: manual status announcements ────────────────────────────────────────────
@@ -165,7 +200,10 @@ export function createApp(deps: Deps): Hono {
     const known = new Set(config.monitors.map((monitor) => monitor.id))
     if (input.monitors.some((id) => !known.has(id))) return c.json({ error: 'Unknown monitor' }, 400)
     const announcement = await createAnnouncement(deps.db, input, nowSeconds())
-    runAfterResponse(c, deps, enqueueAnnouncement(deps, announcement, 'created', nowSeconds()).then(() => dispatchSubscriberOutbox(deps, nowSeconds())))
+    runAfterResponse(c, deps, Promise.all([
+      enqueueAnnouncement(deps, announcement, 'created', nowSeconds()).then(() => dispatchSubscriberOutbox(deps, nowSeconds())),
+      enqueueAnnouncementNotifications(deps, announcement, nowSeconds()).then(() => dispatchAnnouncementNotifications(deps, nowSeconds())),
+    ]))
     return c.json(announcement, 201)
   })
   const updateAnnouncement = async (c: Context, raw: unknown, routeId?: string) => {
@@ -179,7 +217,10 @@ export function createApp(deps: Deps): Hono {
     const known = new Set(config.monitors.map((monitor) => monitor.id))
     if (input.monitors?.some((monitor) => !known.has(monitor))) return c.json({ error: 'Unknown monitor' }, 400)
     const announcement = await patchAnnouncement(deps.db, id, input, nowSeconds())
-    if (announcement) runAfterResponse(c, deps, enqueueAnnouncement(deps, announcement, `update:${announcement.updates[0]?.id ?? announcement.id}`, nowSeconds()).then(() => dispatchSubscriberOutbox(deps, nowSeconds())))
+    if (announcement && (input.status !== undefined || input.body !== undefined)) runAfterResponse(c, deps, Promise.all([
+      enqueueAnnouncement(deps, announcement, `update:${announcement.updates[0]?.id ?? announcement.id}`, nowSeconds()).then(() => dispatchSubscriberOutbox(deps, nowSeconds())),
+      enqueueAnnouncementNotifications(deps, announcement, nowSeconds()).then(() => dispatchAnnouncementNotifications(deps, nowSeconds())),
+    ]))
     return announcement ? c.json(announcement) : c.text('Not found', 404)
   }
   // Accept both REST-style /:id and the documented collection endpoint with an id in JSON.

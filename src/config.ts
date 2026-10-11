@@ -1,6 +1,7 @@
 import { Cron } from 'croner'
 import { parseJsonPath } from './evaluate/json.ts'
 import { isValidTimeZone, parseDuration } from './util/time.ts'
+import { OFFICIAL_MANIFEST_URL, OFFICIAL_RELEASE_PUBLIC_KEY } from './updates.ts'
 
 // ─── Public config types (what users write in statusping.config.ts) ────────────────────────
 
@@ -229,6 +230,12 @@ export interface SubscriberConfigInput {
   from: string
 }
 
+/** Optional operator-facing delivery for manual status announcements. Disabled unless a sink is named. */
+export interface AnnouncementNotificationsInput {
+  /** Alert sink names to receive every announcement create/update. */
+  notify: string[]
+}
+
 export type AuthProviderInput =
   /** Per-user email + password from the BASIC_AUTH_USERS secret (`npm run cli -- add-user`). */
   | { type: 'basic' }
@@ -270,6 +277,8 @@ export interface StatusPingConfig {
   /** IANA timezone used for times on the status page and in alerts. Default UTC. */
   timezone?: string
   sinks?: Record<string, SinkInput>
+  /** Deliver manual announcement create/updates to these alert sinks. Off by default. */
+  announcements?: AnnouncementNotificationsInput
   subscribers?: SubscriberConfigInput
   defaults?: { notify?: string[]; grace?: Duration; renotifyEvery?: Duration; renotifyMax?: number }
   /** Monitor definitions. Group names become the sections on pages. */
@@ -303,6 +312,14 @@ export interface StatusPingConfig {
   }
   /** Enable the database-backed browser admin. Off by default: config-as-code remains authoritative. */
   admin?: boolean
+  /** Opt-in, signed release-manifest checks shown only to authenticated administrators. */
+  updates?: {
+    enabled?: boolean
+    /** HTTPS URL of the signed release manifest. Defaults to the latest official GitHub Release. */
+    manifestUrl?: string
+    /** Base64-encoded 32-byte Ed25519 public key used to verify the manifest signature. Defaults to the official release key. */
+    publicKey?: string
+  }
 }
 
 export function defineConfig(config: StatusPingConfig): StatusPingConfig {
@@ -461,6 +478,7 @@ export interface NormalizedConfig {
   description: string | null
   timezone: string
   sinks: Record<string, SinkInput>
+  announcements: { notify: string[] }
   subscribers: SubscriberConfigInput | null
   monitors: Monitor[]
   peer: { pingUrl: Secret | null; heartbeatMonitor: string | null; healthMonitor: string | null }
@@ -469,6 +487,7 @@ export interface NormalizedConfig {
   pages: NormalizedPage[]
   home: string | null
   maintenance: NormalizedMaintenance[]
+  updates: { enabled: boolean; manifestUrl: string | null; publicKey: string | null }
 }
 
 export class ConfigError extends Error {
@@ -599,6 +618,42 @@ export function normalizeConfig(config: StatusPingConfig): NormalizedConfig {
   } catch {
     problems.push(`baseUrl: "${config.baseUrl}" is not a valid URL`)
   }
+  let updates: NormalizedConfig['updates'] = { enabled: false, manifestUrl: null, publicKey: null }
+  if (config.updates !== undefined) {
+    const input = config.updates
+    if (!input || typeof input !== 'object' || Array.isArray(input)) {
+      problems.push('updates: must be an object')
+    } else {
+      const enabled = input.enabled ?? false
+      if (typeof enabled !== 'boolean') problems.push('updates.enabled: must be a boolean')
+      const manifestUrl = input.manifestUrl
+      const publicKey = input.publicKey
+      if (manifestUrl !== undefined && typeof manifestUrl !== 'string') problems.push('updates.manifestUrl: must be a string')
+      if (publicKey !== undefined && typeof publicKey !== 'string') problems.push('updates.publicKey: must be a base64 Ed25519 public key')
+      if (typeof manifestUrl === 'string') {
+        try {
+          const url = new URL(manifestUrl)
+          // A manifest is public, static release metadata.  Keeping its URL
+          // free of userinfo, queries, and fragments prevents an operator
+          // accidentally placing a bearer-like value in editable config (or
+          // subsequently sending it as part of an outbound request).
+          if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash) problems.push('updates.manifestUrl: must be an HTTPS URL without credentials, query parameters, or fragments')
+        } catch { problems.push('updates.manifestUrl: must be a valid HTTPS URL') }
+      }
+      let keyIsValid = false
+      if (typeof publicKey === 'string') {
+        try { keyIsValid = Uint8Array.from(atob(publicKey), (char) => char.charCodeAt(0)).byteLength === 32 } catch { /* report below */ }
+        if (!keyIsValid) problems.push('updates.publicKey: must be a base64-encoded 32-byte Ed25519 public key')
+      }
+      // Enabling checks without a source uses the official GitHub Release
+      // manifest and release key; either can be overridden for a mirror.
+      if (typeof enabled === 'boolean' && (publicKey === undefined || keyIsValid)) {
+        updates = enabled
+          ? { enabled, manifestUrl: typeof manifestUrl === 'string' ? manifestUrl : OFFICIAL_MANIFEST_URL, publicKey: typeof publicKey === 'string' ? publicKey : OFFICIAL_RELEASE_PUBLIC_KEY }
+          : { enabled, manifestUrl: typeof manifestUrl === 'string' ? manifestUrl : null, publicKey: typeof publicKey === 'string' ? publicKey : null }
+      }
+    }
+  }
   for (const [name, sink] of Object.entries(sinks)) {
     if (!['pushover', 'ntfy', 'telegram', 'webhook', 'discord', 'slack', 'email'].includes(sink.type)) {
       problems.push(`sinks.${name}: unknown type "${(sink as { type: string }).type}"`)
@@ -626,6 +681,18 @@ export function normalizeConfig(config: StatusPingConfig): NormalizedConfig {
           problems.push(`sinks.${name}.via.from: must be an email address`)
         }
       }
+    }
+  }
+
+  let announcementNotify: string[] = []
+  if (config.announcements !== undefined) {
+    const notify = config.announcements?.notify
+    if (!Array.isArray(notify) || notify.length === 0 || notify.some((sink) => typeof sink !== 'string')) {
+      problems.push('announcements.notify: must name one or more sinks')
+    } else {
+      if (new Set(notify).size !== notify.length) problems.push('announcements.notify: must not contain duplicates')
+      for (const sink of notify) if (!sinks[sink]) problems.push(`announcements.notify references unknown sink "${sink}"`)
+      announcementNotify = notify
     }
   }
 
@@ -891,6 +958,7 @@ export function normalizeConfig(config: StatusPingConfig): NormalizedConfig {
     description: config.description ?? null,
     timezone,
     sinks,
+    announcements: { notify: announcementNotify },
     subscribers,
     monitors,
     peer,
@@ -899,6 +967,7 @@ export function normalizeConfig(config: StatusPingConfig): NormalizedConfig {
     pages,
     home,
     maintenance,
+    updates,
   }
 }
 
