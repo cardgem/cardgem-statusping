@@ -1,9 +1,10 @@
 import type { Context } from 'hono'
 import { getCookie } from 'hono/cookie'
 import { canAcknowledge, type Viewer } from '../auth/viewer.ts'
-import { type EnvGetter, type EnvRef, type NormalizedConfig, normalizeConfig, resolveConfigEnv, type StatusPingConfig } from '../config.ts'
+import { type EnvGetter, type EnvRef, isReservedEnv, type NormalizedConfig, normalizeConfig, resolveConfigEnv, type StatusPingConfig } from '../config.ts'
 import type { Db } from '../db/types.ts'
 import { randomToken, sha256Hex, timingSafeEqual } from '../util/crypto.ts'
+import { normalizeSchedule } from '../maintenance.ts'
 import { TENANT_ENV, clampToTenantPolicy, explicitIntervalIds, parseTenantPolicy, tenantPolicyProblems } from '../platform.ts'
 
 /** Configuration accepted by the browser admin.  It is opt-in on purpose. */
@@ -16,10 +17,35 @@ function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
 }
 
-function envRef(value: unknown, path: string, problems: string[]): value is EnvRef {
+/**
+ * Where a secret reference appears decides which names it may read. A reference resolves to a
+ * real value that may be sent somewhere (a webhook header, a monitor URL), so:
+ * - StatusPing's own server secrets are never readable (isReservedEnv);
+ * - sign-in settings (OIDC_*, CF_ACCESS_AUD) only from the sign-in method;
+ * - a channel's saved credential (SINK_<NAME>_<FIELD>) only from the field it was saved for, so a
+ *   channel can't be retyped to send its own stored credential somewhere else.
+ */
+type RefScope = { kind: 'provider' } | { kind: 'sink'; name: string; field: string | null } | { kind: 'other' }
+const SIGN_IN_ENV = /^(OIDC_[A-Z0-9_]+|CF_ACCESS_AUD)$/
+const sinkEnv = (name: string, field: string) => `SINK_${name}_${field}`.toUpperCase().replace(/[^A-Z0-9_]/g, '_')
+
+function envRef(value: unknown, path: string, problems: string[], scope: RefScope = { kind: 'other' }): value is EnvRef {
   const ref = record(value)
   if (!ref || typeof ref.$env !== 'string' || !ENV_NAME.test(ref.$env) || Object.keys(ref).some((key) => key !== '$env' && key !== 'optional')) {
     problems.push(`${path}: must be a secret reference, { $env: NAME }`)
+    return false
+  }
+  const name = ref.$env
+  if (isReservedEnv(name)) {
+    problems.push(`${path}: ${name} is a server secret and cannot be referenced`)
+    return false
+  }
+  if (SIGN_IN_ENV.test(name) && scope.kind !== 'provider') {
+    problems.push(`${path}: ${name} belongs to the sign-in method and cannot be referenced here`)
+    return false
+  }
+  if (name.startsWith('SINK_') && !(scope.kind === 'sink' && scope.field !== null && name === sinkEnv(scope.name, scope.field))) {
+    problems.push(`${path}: ${name} is a saved channel credential and can only be used by the field it was saved for`)
     return false
   }
   if (ref.optional !== undefined && typeof ref.optional !== 'boolean') problems.push(`${path}.optional: must be a boolean`)
@@ -37,14 +63,14 @@ function literalUrl(value: string, path: string, problems: string[]): void {
 }
 
 /** Header values: literal text, or { $env: NAME }. Credential-bearing headers must use $env. */
-function headerValues(value: unknown, path: string, problems: string[]): void {
+function headerValues(value: unknown, path: string, problems: string[], scope: RefScope = { kind: 'other' }): void {
   if (value === undefined) return
   const headers = record(value)
   if (!headers) { problems.push(`${path}: must be an object`); return }
   for (const [header, item] of Object.entries(headers)) {
     if (typeof item === 'string') {
       if (SENSITIVE_NAME.test(header)) problems.push(`${path}.${header}: holds a credential. Store it as a secret and write { $env: NAME } instead`)
-    } else envRef(item, `${path}.${header}`, problems)
+    } else envRef(item, `${path}.${header}`, problems, scope)
   }
 }
 
@@ -62,7 +88,8 @@ export function validateAdminSecrets(value: unknown): string[] {
   for (const [name, raw] of Object.entries(sinks ?? {})) {
     const sink = record(raw)
     if (!sink || typeof sink.type !== 'string') { problems.push(`sinks.${name}: must be an object`); continue }
-    const ref = (key: string) => envRef(sink[key], `sinks.${name}.${key}`, problems)
+    const scope = (field: string | null): RefScope => ({ kind: 'sink', name, field })
+    const ref = (key: string) => envRef(sink[key], `sinks.${name}.${key}`, problems, scope(key))
     switch (sink.type) {
       case 'pushover': ref('appToken'); ref('userKey'); break
       case 'ntfy':
@@ -79,10 +106,10 @@ export function validateAdminSecrets(value: unknown): string[] {
       case 'email': {
         const via = sink.via
         if (via && typeof via === 'object' && !Array.isArray(via) && (via as Record<string, unknown>).provider === 'resend') {
-          envRef((via as Record<string, unknown>).apiKey, `sinks.${name}.via.apiKey`, problems)
+          envRef((via as Record<string, unknown>).apiKey, `sinks.${name}.via.apiKey`, problems, scope('apiKey'))
         }
         if (via && typeof via === 'object' && !Array.isArray(via) && (via as Record<string, unknown>).provider === 'smtp' && (via as Record<string, unknown>).password !== undefined) {
-          envRef((via as Record<string, unknown>).password, `sinks.${name}.via.password`, problems)
+          envRef((via as Record<string, unknown>).password, `sinks.${name}.via.password`, problems, scope('password'))
         }
         break
       }
@@ -90,9 +117,9 @@ export function validateAdminSecrets(value: unknown): string[] {
         // A credential in the URL or a header must be a secret: { $env: NAME }, never a literal.
         if (typeof sink.url === 'string') literalUrl(sink.url, `sinks.${name}.url`, problems)
         else if (sink.url === undefined) problems.push(`sinks.${name}.url: must be a URL or { $env: NAME }`)
-        else envRef(sink.url, `sinks.${name}.url`, problems)
-        headerValues(sink.headers, `sinks.${name}.headers`, problems)
-        if (sink.secret !== undefined) envRef(sink.secret, `sinks.${name}.secret`, problems)
+        else envRef(sink.url, `sinks.${name}.url`, problems, scope('url'))
+        headerValues(sink.headers, `sinks.${name}.headers`, problems, scope(null))
+        if (sink.secret !== undefined) envRef(sink.secret, `sinks.${name}.secret`, problems, scope('secret'))
         break
       }
     }
@@ -101,8 +128,11 @@ export function validateAdminSecrets(value: unknown): string[] {
   if (subscribers?.provider === 'resend') envRef(subscribers.apiKey, 'subscribers.apiKey', problems)
   const access = record(config.access)
   const provider = record(access?.provider)
-  if (provider?.type === 'cloudflare-access') envRef(provider.audience, 'access.provider.audience', problems)
-  if (provider?.type === 'oidc') envRef(provider.clientSecret, 'access.provider.clientSecret', problems)
+  if (provider?.type === 'cloudflare-access') envRef(provider.audience, 'access.provider.audience', problems, { kind: 'provider' })
+  if (provider?.type === 'oidc') {
+    envRef(provider.clientSecret, 'access.provider.clientSecret', problems, { kind: 'provider' })
+    if (provider.clientId !== undefined && typeof provider.clientId !== 'string') envRef(provider.clientId, 'access.provider.clientId', problems, { kind: 'provider' })
+  }
   const peer = record(config.peer)
   if (peer?.pingUrl !== undefined && peer.pingUrl !== null) envRef(peer.pingUrl, 'peer.pingUrl', problems)
   for (const [groupIndex, groupValue] of (Array.isArray(config.groups) ? config.groups : []).entries()) {
@@ -138,6 +168,8 @@ export function envReferences(value: unknown): Array<{ name: string; paths: stri
 export interface AdminConfigValidation {
   config: AdminConfig
   normalized: NormalizedConfig
+  /** Loading only: settings an older release accepted that were dropped or clamped to load. */
+  warnings: string[]
 }
 
 /**
@@ -145,24 +177,78 @@ export interface AdminConfigValidation {
  * tenant, a save over the plan's limits is rejected; loading an already-stored config instead
  * fits it into the plan, so a downgrade never takes the site down.
  */
+/** A saved config stores recurring schedules in their normalised form (whitespace collapsed). */
+function withNormalizedSchedules(config: Record<string, unknown>): Record<string, unknown> {
+  if (!Array.isArray(config.maintenance)) return config
+  let changed = false
+  const maintenance = config.maintenance.map((window: unknown) => {
+    const w = record(window)
+    if (!w || typeof w.schedule !== 'string') return window
+    const schedule = normalizeSchedule(w.schedule)
+    if (schedule === w.schedule || !schedule) return window
+    changed = true
+    return { ...w, schedule }
+  })
+  return changed ? { ...config, maintenance } : config
+}
+
+/**
+ * Releases before 0.2.24 stored HTTP monitor header values that were numbers or booleans (sent as
+ * text). Loading reads them as the strings they were sent as, so such a site keeps loading; the
+ * credential-name check below still applies to them. Saving refuses them.
+ */
+function withLegacyHeaderValues(config: Record<string, unknown>): Record<string, unknown> {
+  if (!Array.isArray(config.groups)) return config
+  let changed = false
+  const groups = config.groups.map((groupValue: unknown) => {
+    const group = record(groupValue)
+    if (!group || !Array.isArray(group.monitors)) return groupValue
+    let groupChanged = false
+    const monitors = group.monitors.map((monitorValue: unknown) => {
+      const monitor = record(monitorValue)
+      const headers = record(monitor?.headers)
+      if (!monitor || !headers || !Object.values(headers).some((v) => typeof v === 'number' || typeof v === 'boolean')) return monitorValue
+      groupChanged = true
+      return { ...monitor, headers: Object.fromEntries(Object.entries(headers).map(([k, v]) => [k, typeof v === 'number' || typeof v === 'boolean' ? String(v) : v])) }
+    })
+    if (!groupChanged) return groupValue
+    changed = true
+    return { ...group, monitors }
+  })
+  return changed ? { ...config, groups } : config
+}
+
 export function validateAdminConfig(value: unknown, getEnv: EnvGetter, mode: 'save' | 'load' = 'save'): AdminConfigValidation {
-  const config = record(value)
-  if (!config) throw new Error('config: must be an object')
+  const input = record(value)
+  if (!input) throw new Error('config: must be an object')
+  const config = mode === 'save' ? withNormalizedSchedules(input) : withLegacyHeaderValues(input)
   const admin = config.admin
   if (admin !== undefined && typeof admin !== 'boolean') throw new Error('admin: must be a boolean')
   const problems = validateAdminSecrets(config)
+  // The ntfy server receives the topic and access token. Checked on save only, so a site that
+  // already uses a plain-http server keeps loading.
+  if (mode === 'save') {
+    for (const [name, sink] of Object.entries(record(config.sinks) ?? {})) {
+      const s = record(sink)
+      if (s?.type !== 'ntfy' || s.server === undefined) continue
+      let ok = false
+      try { ok = typeof s.server === 'string' && new URL(s.server).protocol === 'https:' } catch { /* reported below */ }
+      if (!ok) problems.push(`sinks.${name}.server: must be an https:// URL`)
+    }
+  }
   if (problems.length) throw new Error(`Unsafe admin config:\n  - ${problems.join('\n  - ')}`)
   try {
     // Environment-backed monitor URLs need a harmless placeholder during validation.  Their
     // actual value stays in the environment and is resolved only when the config becomes active.
-    const normalized = normalizeConfig(resolveConfigEnv(config as unknown as StatusPingConfig, getEnv, true))
+    const warnings: string[] = []
+    const normalized = normalizeConfig(resolveConfigEnv(config as unknown as StatusPingConfig, getEnv, true), { save: mode === 'save', warnings })
     const tenant = parseTenantPolicy(getEnv(TENANT_ENV))
-    if (!tenant) return { config: config as unknown as AdminConfig, normalized }
+    if (!tenant) return { config: config as unknown as AdminConfig, normalized, warnings }
     if (mode === 'save') {
       const overLimit = tenantPolicyProblems(normalized, tenant, explicitIntervalIds(config as unknown as StatusPingConfig))
       if (overLimit.length) throw new Error(`Over your plan's limits:\n  - ${overLimit.join('\n  - ')}`)
     }
-    return { config: config as unknown as AdminConfig, normalized: clampToTenantPolicy(normalized, tenant) }
+    return { config: config as unknown as AdminConfig, normalized: clampToTenantPolicy(normalized, tenant), warnings }
   } catch (error) {
     throw error instanceof Error ? error : new Error(String(error))
   }

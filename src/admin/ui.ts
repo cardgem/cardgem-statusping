@@ -11,6 +11,7 @@ import { SINK_FIELDS } from './forms.ts'
 import type { StoredUpdateCheck } from '../updates.ts'
 import { type ApiToken, MCP_SCOPES, type McpScope } from '../mcp/tokens.ts'
 import { releaseNotesUrl } from '../updates.ts'
+import type { CadenceViolation } from '../maintenance.ts'
 import { STYLES } from '../web/styles.ts'
 import { timezoneSelect } from '../util/timezones.ts'
 
@@ -69,6 +70,8 @@ textarea.code { min-height: 24rem; font: 13px/1.5 ui-monospace, SFMono-Regular, 
 .alert { margin: 0 0 16px; padding: 10px 12px; border: 1px solid var(--border); border-radius: calc(var(--radius) - 2px); font-size: 14px; }
 .alert.warning { border-color: color-mix(in oklab, var(--warning) 55%, var(--border)); background: color-mix(in oklab, var(--warning) 8%, var(--card)); }
 .alert.success { border-color: color-mix(in oklab, var(--success) 55%, var(--border)); background: color-mix(in oklab, var(--success) 8%, var(--card)); }
+.alert.error { border-color: color-mix(in oklab, var(--destructive) 55%, var(--border)); background: color-mix(in oklab, var(--destructive) 8%, var(--card)); }
+.alert ul { margin: 8px 0 0; padding-left: 20px; overflow-wrap: anywhere; }
 .table { width: 100%; border-collapse: collapse; font-size: 14px; }
 .table th { padding: 0 12px 8px 0; text-align: left; font-weight: 500; color: var(--muted-foreground); border-bottom: 1px solid var(--border); }
 .table td { padding: 10px 12px 10px 0; border-bottom: 1px solid var(--border); vertical-align: middle; overflow-wrap: normal; }
@@ -120,20 +123,27 @@ const notice = (text: string | undefined, kind: 'error' | 'success' = 'success')
   !text ? '' : kind === 'error' ? `<p class="form-error" role="alert">${escape(text)}</p>` : `<p class="alert success" role="status">${escape(text)}</p>`
 
 /** Page shell: the site header with the account menu, then the section menu and content. */
-export function layout(opts: { viewer: Viewer; section: Section; title: string; description?: string; actions?: string; body: string; notice?: string; error?: string }): string {
+export function layout(opts: { viewer: Viewer; section: Section; title: string; /** Plain text; escaped here. */ description?: string; actions?: string; body: string; notice?: string; error?: string }): string {
   const nav = SECTIONS.map(([id, label, href]) => `<li><a href="${href}"${id === opts.section ? ' aria-current="page"' : ''}>${label}</a></li>`).join('')
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><title>${escape(opts.title)} · Settings</title><style>${STYLES}${ADMIN_STYLES}</style></head><body>
-<header class="site-header"><div class="wrap site-header-inner" style="max-width:1080px"><nav class="header-nav" aria-label="Site"><a class="header-link" href="/">Home</a><a class="header-link" href="/admin" aria-current="page">Settings</a></nav><div class="account"><span class="muted small account-email">${escape(opts.viewer.email)}</span><a class="btn-outline" href="/auth/logout">Sign out</a></div></div></header>
+<header class="site-header"><div class="wrap site-header-inner" style="max-width:1080px"><nav class="header-nav" aria-label="Site"><a class="header-link" href="/">Home</a><a class="header-link" href="/admin" aria-current="page">Settings</a></nav><div class="account"><span class="muted small account-email">${escape(opts.viewer.email)}</span><form method="post" action="/auth/logout" style="display:contents"><button class="btn-outline" type="submit">Sign out</button></form></div></div></header>
 <main class="wrap" style="max-width:1080px"><div class="settings">
 <nav class="settings-nav" aria-label="Settings"><ul>${nav}</ul><div class="nav-foot"><a href="/">← View status page</a></div></nav>
-<div><div class="settings-head"><div><h1>${escape(opts.title)}</h1>${opts.description ? `<p>${opts.description}</p>` : ''}</div>${opts.actions ?? ''}</div>
+<div><div class="settings-head"><div><h1>${escape(opts.title)}</h1>${opts.description ? `<p>${escape(opts.description)}</p>` : ''}</div>${opts.actions ?? ''}</div>
 <!--banner-->${notice(opts.notice)}${notice(opts.error, 'error')}${opts.body}</div></div></main>
 <script>${REVEAL_SCRIPT};${COPY_SCRIPT}</script></body></html>`
 }
 
 // ── General ─────────────────────────────────────────────────────────────────────────────────
 
-export function generalPage(opts: { viewer: Viewer; csrf: string; title: string; baseUrl: string; timezone: string; updatesEnabled: boolean; installedVersion: string; update: UpdateState; notice?: string; error?: string; resetError?: string }): string {
+/** Stored maintenance windows that break the cadence rule: the status page and alerts disagree on them. */
+function cadenceCard(violations: readonly CadenceViolation[] | undefined): string {
+  if (!violations?.length) return ''
+  const items = violations.map((v) => `<li><strong>${escape(v.title)}</strong> <code>${escape(v.schedule)}</code> (${escape(v.tz)}): ${escape(v.problem)}</li>`).join('')
+  return `<section class="card"><p class="alert warning">These recurring maintenance windows were saved before the hourly cadence rule. Alerts still treat them as maintenance, but the status page history skips them. Fix or remove them in <a href="/admin/configuration">Configuration</a>.</p><ul>${items}</ul></section>`
+}
+
+export function generalPage(opts: { viewer: Viewer; csrf: string; title: string; baseUrl: string; timezone: string; updatesEnabled: boolean; installedVersion: string; update: UpdateState; cadence?: readonly CadenceViolation[]; notice?: string; error?: string; resetError?: string }): string {
   const u = opts.update
   const available = u.result === 'available' && u.targetVersion ? u.targetVersion : null
   // A release that needs an intermediate one first: statusp.ing offers that release, then this one.
@@ -151,7 +161,7 @@ export function generalPage(opts: { viewer: Viewer; csrf: string; title: string;
     u.result === 'disabled' ? '' : `<form method="post" action="/admin/updates/check" style="display:contents">${hidden(opts.csrf)}<button class="btn-outline" type="submit">Check for updates</button></form>`,
     offered ? `<a class="btn-outline" href="${escape(releaseNotesUrl(offered))}">Release notes</a>` : '',
   ].filter(Boolean).join('')
-  return layout({ ...opts, section: 'general', title: 'General', description: 'Your status site and its software.', body: `
+  return layout({ ...opts, section: 'general', title: 'General', description: 'Your status site and its software.', body: `${cadenceCard(opts.cadence)}
 <section class="card"><h2>Site</h2><p class="lead">Shown on your status pages and used in alert links.</p>
 <form class="form" method="post" action="/admin/general">${hidden(opts.csrf)}
 ${field('Site title', textInput('title', opts.title, 'maxlength="80" required'))}
@@ -229,7 +239,7 @@ ${pingSection}${danger}` })
 }
 
 export function pingUrlPage(opts: { viewer: Viewer; monitorName: string; monitorId: string; pingUrl: string; created?: boolean }): string {
-  return layout({ ...opts, section: 'monitors', title: opts.created ? 'Monitor added' : 'New ping URL', description: escape(opts.monitorName), body: `<section class="card">
+  return layout({ ...opts, section: 'monitors', title: opts.created ? 'Monitor added' : 'New ping URL', description: opts.monitorName, body: `<section class="card">
 <p class="alert warning">${opts.created ? 'This is the job\'s ping URL. It is shown only once: copy it now.' : 'This URL is shown only once. Copy it now; the previous URL no longer works.'}</p><p class="secret" data-copy="ping URL">${escape(opts.pingUrl)}</p>
 <p>Call it when the job finishes, for example:</p><pre>curl -fsS ${escape(opts.pingUrl)}</pre>
 <p class="hint" style="margin:8px 0 16px">Report a failure with <code>/fail</code> on the end; mark the start with <code>/start</code> to track run time.</p>
@@ -344,13 +354,38 @@ ${editing ? `<section class="card danger"><h2>Delete channel</h2><p class="lead"
 
 // ── Access ──────────────────────────────────────────────────────────────────────────────────
 
-export function accessPage(opts: { viewer: Viewer; csrf: string; providerSummary: string; admins: string[]; notice?: string; error?: string; values?: Record<string, string> }): string {
+/** A password stored in the site, as Settings → Access lists it. */
+export interface StoredPasswordRow {
+  email: string
+  createdAt: number
+  /** It signs in under the current configuration (email + password, and still an administrator). */
+  allowed: boolean
+  /** The sentence to show when BASIC_AUTH_USERS also lists the address and is ignored for it. */
+  envIgnored: string | null
+  /** The signed-in administrator's own address. */
+  self: boolean
+}
+
+function storedPasswordsCard(csrf: string, rows: StoredPasswordRow[], basic: boolean): string {
+  if (!rows.length && !basic) return ''
+  const items = rows.map((r) => `<tr><td><strong>${escape(r.email)}</strong><span class="sub">Set ${when16(r.createdAt)}</span>
+${r.allowed ? '' : '<span class="sub">Cannot sign in: not an administrator with email and password</span>'}
+${r.envIgnored ? `<p class="alert warning" role="status">${escape(r.envIgnored)}</p>` : ''}</td>
+<td class="end">${r.self ? '<span class="hint">Your own: another administrator has to remove it.</span>'
+    : `<form method="post" action="/admin/access/passwords/remove" style="display:inline">${hidden(csrf)}<input type="hidden" name="email" value="${escape(r.email)}"><button class="btn-outline" type="submit">Remove</button></form>`}</td></tr>`).join('')
+  return `<section class="card" id="stored-passwords"><h2>Passwords stored in the site</h2>
+<p class="lead">Set by setup, <strong>Change sign-in method</strong> or <code>npm run cli -- recover</code>. A stored password takes precedence over <code>BASIC_AUTH_USERS</code>, so changing or removing someone's <code>BASIC_AUTH_USERS</code> entry does not revoke it: remove it here. Removing someone from the administrators removes their stored password too. Removing a password does not end a session already signed in; it lasts until it expires.</p>
+${items ? `<div class="scroll" tabindex="0" role="region" aria-label="Passwords stored in the site"><table class="table"><thead><tr><th>Address</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody>${items}</tbody></table></div>` : '<p class="hint">No passwords are stored in the site. Everyone signs in with <code>BASIC_AUTH_USERS</code>.</p>'}</section>`
+}
+
+export function accessPage(opts: { viewer: Viewer; csrf: string; providerSummary: string; admins: string[]; storedPasswords?: StoredPasswordRow[]; basic?: boolean; notice?: string; error?: string; values?: Record<string, string> }): string {
   return layout({ ...opts, section: 'access', title: 'Access', description: 'Who can sign in to Settings.', body: `
 <section class="card"><h2>Sign-in method</h2><p class="lead">${opts.providerSummary}</p><div class="actions"><a class="btn-outline" href="/admin/access/method">Change sign-in method</a></div></section>
 <section class="card"><h2>Administrators</h2><p class="lead">These people can open Settings after signing in.</p>
 <form class="form" method="post" action="/admin/access">${hidden(opts.csrf)}
 ${field('Administrator emails', `<textarea class="input" id="admins" name="admins" placeholder="one per line, or *@your-domain.com">${escape(opts.values?.admins ?? opts.admins.join('\n'))}</textarea>`, 'You cannot remove yourself; another administrator has to.')}
-<div class="actions"><button class="btn-primary" type="submit">Save administrators</button></div></form></section>` })
+<div class="actions"><button class="btn-primary" type="submit">Save administrators</button></div></form></section>
+${storedPasswordsCard(opts.csrf, opts.storedPasswords ?? [], opts.basic ?? false)}` })
 }
 
 // ── MCP ─────────────────────────────────────────────────────────────────────────────────────
@@ -436,7 +471,7 @@ export function diffBlock(lines: Array<{ op: ' ' | '+' | '-'; text: string } | n
 export function revisionPage(opts: { viewer: Viewer; csrf: string; revision: { id: number; actor: string; action: string; at: number }; current: number; diff: string; notice?: string; error?: string }): string {
   const r = opts.revision
   const isCurrent = r.id === opts.current
-  return layout({ ...opts, section: 'configuration', title: `Version ${r.id}`, description: `${escape(actionLabel(r.action))} · ${escape(r.actor)} · ${when16(r.at)}`, body: `
+  return layout({ ...opts, section: 'configuration', title: `Version ${r.id}`, description: `${actionLabel(r.action)} · ${r.actor} · ${when16(r.at)}`, body: `
 <section class="card"><h2>${isCurrent ? 'This is the current version' : `Changes from version ${r.id} to the current version (${opts.current})`}</h2>
 <p class="lead">${isCurrent ? 'Compare an earlier version from the history to see what changed since.' : 'Lines marked − are in this version; lines marked + are in the current one.'}</p>
 ${isCurrent ? '' : opts.diff}</section>
@@ -460,8 +495,8 @@ export function activityPage(opts: { viewer: Viewer; audit: AuditEntry[] }): str
 function resetCard(csrf: string, error?: string): string {
   return `<section class="card danger" id="reset"><h2>Reset to the setup wizard</h2>
 <p class="lead">Start over with the setup wizard, where you choose the sign-in method and settings again.</p>
-<ul class="changes"><li>Everyone is signed out, and built-in accounts are removed.</li><li>Checks stop and every page sends visitors to setup until it is finished.</li>
-<li>The current configuration and all monitor history are kept. The reset is recorded in Activity.</li></ul>
+<ul class="changes"><li>Everyone is signed out (also with <code>SESSION_SECRET</code> set), built-in accounts and MCP access tokens are removed, and acknowledgement links in alerts already sent stop working.</li><li>Ping URLs of scheduled jobs created here are revoked. After setup, create a new one for each job and update the jobs that call them.</li><li>Checks stop and every page sends visitors to setup until it is finished.</li>
+<li>The current configuration, all monitor history and email subscribers are kept. The reset is recorded in Activity.</li></ul>
 <p class="hint" style="margin:0 0 16px">Tip: <a href="/admin/configuration">export the configuration</a> first, then import it after setup to keep your monitors, pages and alert channels.</p>
 ${error ? `<p class="form-error" role="alert">${escape(error)}</p>` : ''}
 <form class="form" method="post" action="/admin/reset">${hidden(csrf)}

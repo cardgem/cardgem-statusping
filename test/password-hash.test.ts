@@ -31,7 +31,8 @@ describe('password hashes', () => {
   it('verifyPassword accepts both formats from BASIC_AUTH_USERS and local_users', async () => {
     const t = await createTestDb('libsql'); close = t.close
     const env = { BASIC_AUTH_USERS: JSON.stringify({ 'legacy@example.test': await hashPassword('generated-legacy-password') }) }
-    const deps = makeDeps(t.db, { env })
+    // A stored password counts only for an administrator of a site that uses email + password (v0.3.20).
+    const deps = makeDeps(t.db, { env, config: testConfig({ access: { provider: { type: 'basic' }, admins: { emails: ['owner@example.test', 'old@example.test'] } } }) })
     await t.db.run(`INSERT INTO local_users (email, password_hash, created_at) VALUES (?, ?, ?)`, ['owner@example.test', await hashUserPassword('owner chosen password'), 0])
     await t.db.run(`INSERT INTO local_users (email, password_hash, created_at) VALUES (?, ?, ?)`, ['old@example.test', await hashPassword('old-generated-password'), 0])
 
@@ -55,7 +56,7 @@ describe('password hashes', () => {
     const app = createApp(deps)
     const login = (password: string) => app.request('/auth/login', {
       method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      headers: { 'content-type': 'application/x-www-form-urlencoded', origin: 'http://localhost' },
       body: new URLSearchParams({ email: 'alice@example.test', password, next: '/' }).toString(),
     })
     expect((await login('alice chosen password')).status).toBe(303)

@@ -12,7 +12,11 @@ export type ExpiryLookup =
   | { status: 'unknown'; error: string }
 
 /** A runtime-specific direct certificate lookup (Node uses TLS; Workers use CT). */
-export type CertificateExpiryProvider = (hostname: string, port: number) => Promise<ExpiryLookup>
+/**
+ * Reads a host's certificate directly. `address`, when given, is the vetted address to connect
+ * to (the private-target guard checked it); the hostname is still used for SNI and verification.
+ */
+export type CertificateExpiryProvider = (hostname: string, port: number, options?: { address?: string }) => Promise<ExpiryLookup>
 
 /** Dependencies shared by Worker-safe expiry providers. */
 export interface ExpiryProviderOptions {
@@ -39,3 +43,7 @@ export function toUnixSeconds(value: unknown): number | null {
 export function errorMessage(error: unknown): string {
   return error instanceof Error && error.message ? error.message : String(error)
 }
+
+/** Expiry lookups are advisory: a slow or oversized answer is treated as unknown, never waited out. */
+export const EXPIRY_LOOKUP_TIMEOUT_MS = 10_000
+export const EXPIRY_LOOKUP_MAX_BYTES = 2 * 1024 * 1024

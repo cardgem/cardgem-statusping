@@ -342,9 +342,9 @@ ${field('Configuration', `<textarea class="input code" id="config" name="config"
 <script>document.getElementById('import-file').addEventListener('change',function(){var f=this.files&&this.files[0];if(!f)return;if(f.size>262144){alert('Configuration files must be 256 KB or smaller.');this.value='';return}var r=new FileReader();r.onload=function(){document.getElementById('config').value=String(r.result||'')};r.readAsText(f)})</script>`)
 }
 
-export function reviewPage(opts: { csrf: string; completed: ReadonlySet<SetupStep>; summary: Array<[string, string]>; yaml: string; back?: string; error?: string }): string {
+export function reviewPage(opts: { csrf: string; completed: ReadonlySet<SetupStep>; summary: Array<[string, string]>; yaml: string; back?: string; error?: string; warning?: string }): string {
   return shell('Review', 'review', opts.completed, `<h1>Review and finish</h1>
-<p class="lead">StatusPing will start with these settings. You can change any of them later in the admin.</p>${alert(opts.error)}
+<p class="lead">StatusPing will start with these settings. You can change any of them later in the admin.</p>${alert(opts.error)}${alert(opts.warning, 'warning')}
 <dl class="summary">${opts.summary.map(([label, value]) => `<dt>${escape(label)}</dt><dd>${escape(value)}</dd>`).join('')}</dl>
 <details class="howto"><summary>Show as YAML</summary><p class="hint">This is the configuration file the admin lets you edit directly.</p><pre>${escape(opts.yaml)}</pre></details>
 <form method="post" action="/setup/finish">${hidden(opts.csrf)}<div class="actions"><button class="btn-primary" type="submit">Finish setup</button><a class="btn-outline" href="${opts.back ?? '/setup?step=channel'}">Back</a></div></form>`)
@@ -363,7 +363,7 @@ export function setupDonePage(opts: { pingUrl: string; monitorName: string }): s
 
 export function resetPage(opts: { error?: string }): string {
   return shell('Reset', null, new Set(), `<h1>Reset this StatusPing site</h1>
-<p class="lead">Resetting returns the site to the setup wizard. It signs everyone out, removes built-in accounts, and stops checks until setup is finished again. The current configuration is kept so it can be restored, and monitor history is kept.</p>${alert(opts.error)}
+<p class="lead">Resetting returns the site to the setup wizard. It signs everyone out, removes built-in accounts and MCP access tokens, revokes the ping URLs of scheduled jobs (create new ones after setup), and stops checks until setup is finished again. The current configuration is kept so it can be restored, and monitor history and email subscribers are kept.</p>${alert(opts.error)}
 <form class="setup-form" method="post" action="/setup/reset">
 ${field('Reset token', '<input class="input" id="token" name="token" type="password" autocomplete="off" required autofocus>', 'The value of the <code>STATUSPING_RESET_TOKEN</code> secret. Remove that secret once setup is finished.')}
 ${field('Type <code>reset</code> to confirm', '<input class="input" id="confirm" name="confirm" type="text" autocomplete="off" required>')}

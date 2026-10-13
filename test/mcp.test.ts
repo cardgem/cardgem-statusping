@@ -68,6 +68,15 @@ describe('MCP server', () => {
     expect((await s.call(reader!, 'create_incident', { title: 'x' })).error.message).toContain('not allowed')
   })
 
+  it('escapes the token name on the token-created page', async () => {
+    const s = await setup()
+    await s.send('/admin/mcp')
+    const page = await s.post('/admin/mcp', [['name', '<img src=x onerror=alert(1)>'], ['scopes', 'read']])
+    expect(page.body).toMatch(/value="spm_/)
+    expect(page.body).not.toContain('<img src=x')
+    expect(page.body).toContain('&lt;img src=x onerror=alert(1)&gt;: ')
+  })
+
   it('posts incidents and manages monitors with the matching scopes, then stops after revoke', async () => {
     const s = await setup()
     const token = (await s.createToken('Ops bot', ['read', 'incidents', 'monitors']))!
@@ -133,6 +142,9 @@ describe('MCP server', () => {
 
     // Maintenance windows.
     await ok('add_maintenance', { title: 'DB upgrade', monitors: '*', start: '2026-11-01T02:00:00Z', end: '2026-11-01T03:00:00Z' })
+    // Recurring windows must be at least an hour apart and use five cron fields.
+    expect(await err('add_maintenance', { title: 'Too often', monitors: '*', schedule: '*/5 * * * *', duration: '1m' })).toContain('at least an hour apart')
+    expect(await err('add_maintenance', { title: 'Seconds', monitors: '*', schedule: '0 0 * * * *', duration: '1m' })).toContain('seconds field')
     const windows = (await ok('list_maintenance')).maintenance
     expect(windows).toEqual([expect.objectContaining({ index: 0, title: 'DB upgrade' })])
     expect(await err('delete_maintenance', { index: 0, title: 'Other' })).toContain('No maintenance window')

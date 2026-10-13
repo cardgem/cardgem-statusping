@@ -1,6 +1,9 @@
 import { Cron } from 'croner'
 import { parseJsonPath } from './evaluate/json.ts'
+import { normalizeSchedule, recurringScheduleProblem } from './maintenance.ts'
+import { hasControlChars, isEmailAddress } from './util/email.ts'
 import { isValidTimeZone, parseDuration } from './util/time.ts'
+import { nullProtoRecord } from './util/own.ts'
 import { OFFICIAL_MANIFEST_URL, OFFICIAL_RELEASE_PUBLIC_KEY } from './updates.ts'
 
 // ─── Config types (the YAML document edited in Settings → Configuration) ───────────────────
@@ -588,14 +591,13 @@ function isJsonValue(value: unknown): value is JsonValue {
   return !!value && typeof value === 'object' && Object.getPrototypeOf(value) === Object.prototype && Object.values(value).every(isJsonValue)
 }
 
-function isEmail(value: unknown): value is string {
-  return typeof value === 'string' && /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(value)
-}
+const isEmail = isEmailAddress
 
+/** An address, or `Display Name <address>`. No control characters anywhere: it becomes a header. */
 function isMailbox(value: unknown): value is string {
-  if (typeof value !== 'string') return false
-  const match = value.match(/^.*<([^<>]+)>$/)
-  return isEmail(match ? match[1] : value)
+  if (typeof value !== 'string' || hasControlChars(value) || value.length > 320) return false
+  const match = value.match(/^([^<>]*)<([^<>]+)>$/)
+  return isEmail(match ? match[2] : value)
 }
 
 function normalizeJsonAssertions(input: unknown, fail: (message: string) => void): NormalizedJsonAssertion[] {
@@ -646,15 +648,80 @@ function normalizeJsonAssertions(input: unknown, fail: (message: string) => void
   return assertions
 }
 
-export function normalizeConfig(config: StatusPingConfig): NormalizedConfig {
+export interface NormalizeOptions {
+  /**
+   * Saving a config (rather than loading a stored one) also enforces rules that would make an
+   * already-running site fail to load if applied retroactively, such as the minimum cadence
+   * of recurring maintenance.
+   */
+  save?: boolean
+  /**
+   * Loading only: what was dropped or clamped so a stored configuration an older release accepted
+   * still loads (an unknown sink name, an out-of-range limit). Saving refuses these instead.
+   */
+  warnings?: string[]
+}
+
+/**
+ * A list of strings from user input. Anything else (not a list, or a list holding numbers,
+ * objects or null) becomes a validation problem rather than a TypeError further on; the strings
+ * that are there are kept so the remaining checks can still report on them. With `report` false
+ * (loading a stored configuration, for lists an older release accepted) bad entries are dropped.
+ */
+function stringList(value: unknown, where: string, problems: string[], report = true): string[] {
+  if (value === undefined || value === null) return []
+  if (!Array.isArray(value)) {
+    if (report) problems.push(`${where}: must be a list of strings`)
+    return []
+  }
+  if (report && value.some((item) => typeof item !== 'string')) problems.push(`${where}: every entry must be a string`)
+  return value.filter((item): item is string => typeof item === 'string')
+}
+
+/**
+ * A number within [min, max]. Saving refuses anything else with a problem naming the range. A
+ * stored configuration is only loaded, so an out-of-range value saved by an older release is
+ * clamped (or a non-number replaced by the default) instead of making the whole site fail to load.
+ */
+function boundedNumber(value: unknown, fallback: number, where: string, [min, max]: readonly [number, number], problems: string[], save: boolean, integer = true, warnings?: string[]): number {
+  if (value === undefined) return fallback
+  const valid = typeof value === 'number' && Number.isFinite(value) && (!integer || Number.isInteger(value))
+  if (valid && value >= min && value <= max) return value
+  const message = `${where} must be ${integer ? 'a whole number' : 'a number'} from ${min} to ${max}`
+  const used = valid ? Math.min(max, Math.max(min, value)) : fallback
+  if (save) problems.push(message)
+  else warnings?.push(`${message} (using ${used})`)
+  return used
+}
+
+/** Bounds for the tick's work limits: at least one check (Workers allow 1000 subrequests), and a budget from 1 s to 5 min. */
+export const LIMIT_BOUNDS = { maxChecksPerTick: [1, 1000], tickBudgetMs: [1000, 300_000], maxConfirmationsPerTick: [1, 35], pingPerIpPerMinute: [1, 10_000] } as const
+/** Session length bounds, in hours: from one hour to 30 days. */
+export const SESSION_HOURS_BOUNDS = [1, 720] as const
+
+export function normalizeConfig(config: StatusPingConfig, options: NormalizeOptions = {}): NormalizedConfig {
   const problems: string[] = []
-  const sinks = config.sinks && typeof config.sinks === 'object' && !Array.isArray(config.sinks) ? config.sinks : {}
-  if (config.sinks !== undefined && sinks !== config.sinks) problems.push('sinks: must be an object')
+  const save = options.save === true
+  /**
+   * A rule an older release did not enforce (or enforced more loosely). Saving refuses the value;
+   * loading a stored configuration drops or clamps it and records a warning, so an upgrade never
+   * makes a site that was working fail to load.
+   */
+  const lenient = (message: string, onLoad = '') => {
+    if (save) problems.push(message)
+    else options.warnings?.push(`${message}${onLoad}`)
+  }
+  const configuredSinks = config.sinks && typeof config.sinks === 'object' && !Array.isArray(config.sinks) ? config.sinks : {}
+  if (config.sinks !== undefined && configuredSinks !== config.sinks) problems.push('sinks: must be an object')
+  /** Channels a stored configuration keeps but that cannot be used safely; they are left out on load. */
+  const disabledSinks = new Set<string>()
   let subscribers: SubscriberConfigInput | null = null
   if (config.subscribers !== undefined) {
     const value = config.subscribers
     if (!value || typeof value !== 'object' || value.provider !== 'resend') problems.push('subscribers.provider: must be "resend"')
-    else if (typeof value.from !== 'string' || !isMailbox(value.from)) problems.push('subscribers.from: must be an email address')
+    // 0.3.11 tightened address checks (header injection). A stored sender that no longer passes
+    // turns subscriber email off rather than taking the site down.
+    else if (typeof value.from !== 'string' || !isMailbox(value.from)) lenient('subscribers.from: must be an email address', ' (subscriber email is off until it is fixed)')
     else subscribers = value
   }
   const groups = Array.isArray(config.groups) ? config.groups : []
@@ -702,7 +769,7 @@ export function normalizeConfig(config: StatusPingConfig): NormalizedConfig {
       }
     }
   }
-  for (const [name, sink] of Object.entries(sinks)) {
+  for (const [name, sink] of Object.entries(configuredSinks)) {
     if (!(SINK_TYPES as readonly string[]).includes(sink.type)) {
       problems.push(`sinks.${name}: unknown type "${(sink as { type: string }).type}"`)
     }
@@ -728,13 +795,18 @@ export function normalizeConfig(config: StatusPingConfig): NormalizedConfig {
       }
     }
     if (sink.type === 'email') {
-      if (!Array.isArray(sink.to) || sink.to.length === 0 || sink.to.some((address) => !isEmail(address))) {
-        problems.push(`sinks.${name}.to: must contain one or more email addresses`)
+      // 0.3.11 tightened address checks (no control characters or header delimiters). An address
+      // stored before then disables just this channel on load; saving still refuses it.
+      const disable = (message: string) => {
+        lenient(message, ' (the channel is off until it is fixed)')
+        if (!save) disabledSinks.add(name)
       }
+      if (!Array.isArray(sink.to) || sink.to.length === 0) problems.push(`sinks.${name}.to: must contain one or more email addresses`)
+      else if (sink.to.some((address) => !isEmail(address))) disable(`sinks.${name}.to: must contain one or more email addresses`)
       if (sink.via !== 'cloudflare') {
         if (!sink.via || (sink.via.provider !== 'resend' && sink.via.provider !== 'smtp')) problems.push(`sinks.${name}.via: provider must be "resend" or "smtp"`)
         else if (typeof sink.via.from !== 'string' || !isMailbox(sink.via.from)) {
-          problems.push(`sinks.${name}.via.from: must be an email address`)
+          disable(`sinks.${name}.via.from: must be an email address`)
         }
         if (sink.via && typeof sink.via === 'object' && sink.via.provider === 'smtp') {
           const smtp = sink.via
@@ -749,19 +821,35 @@ export function normalizeConfig(config: StatusPingConfig): NormalizedConfig {
     }
   }
 
+  // No prototype: `config.sinks[name]` is only ever a configured channel, whatever the name.
+  const sinks: Record<string, SinkInput> = nullProtoRecord(Object.entries(configuredSinks).filter(([name]) => !disabledSinks.has(name)))
+  // Own keys only: a name such as "toString" must not resolve to an Object.prototype member.
+  const isSink = (name: string) => Object.prototype.hasOwnProperty.call(sinks, name)
+  /**
+   * Sink names from a notify list. Releases before 0.3.12 did not check every list (defaults.notify
+   * not at all) and resolved names through the prototype, so a stored list may name a channel that
+   * does not exist: loading drops the name with a warning, saving refuses it.
+   */
+  const knownSinks = (names: string[], unknown: (name: string) => string): string[] => names.filter((name) => {
+    if (isSink(name)) return true
+    lenient(unknown(name), disabledSinks.has(name) ? ' (the channel is off)' : ' (left out)')
+    return false
+  })
+
   let announcementNotify: string[] = []
   if (config.announcements !== undefined) {
     const notify = config.announcements?.notify
     if (!Array.isArray(notify) || notify.length === 0 || notify.some((sink) => typeof sink !== 'string')) {
-      problems.push('announcements.notify: must name one or more sinks')
+      lenient('announcements.notify: must name one or more sinks', ' (announcement alerts are off)')
     } else {
-      if (new Set(notify).size !== notify.length) problems.push('announcements.notify: must not contain duplicates')
-      for (const sink of notify) if (!sinks[sink]) problems.push(`announcements.notify references unknown sink "${sink}"`)
-      announcementNotify = notify
+      if (new Set(notify).size !== notify.length) lenient('announcements.notify: must not contain duplicates')
+      announcementNotify = knownSinks([...new Set(notify)], (sink) => `announcements.notify references unknown sink "${sink}"`)
     }
   }
 
-  const defaultNotify = config.defaults?.notify ?? Object.keys(sinks)
+  const defaultNotify = config.defaults?.notify === undefined
+    ? Object.keys(sinks)
+    : knownSinks(stringList(config.defaults.notify, 'defaults.notify', problems, save), (s) => `defaults.notify references unknown sink "${s}"`)
   let defaultGrace = 300
   let defaultRenotifyEvery: number | null = null
   let defaultRenotifyMax: number | null = null
@@ -808,8 +896,7 @@ export function normalizeConfig(config: StatusPingConfig): NormalizedConfig {
       }
       if (seen.has(input.id)) fail('duplicate id')
       seen.add(input.id)
-      const notify = input.notify ?? defaultNotify
-      for (const s of notify) if (!sinks[s]) fail(`notify references unknown sink "${s}"`)
+      const notify = input.notify === undefined ? defaultNotify : knownSinks(stringList(input.notify, `${where}.notify`, problems, save), (s) => `${where}: notify references unknown sink "${s}"`)
 
       let renotifyEvery = defaultRenotifyEvery
       if (input.renotifyEvery !== undefined) {
@@ -846,10 +933,11 @@ export function normalizeConfig(config: StatusPingConfig): NormalizedConfig {
             } catch (error) {
               fail((error as Error).message)
             }
-            const notifyStep = Array.isArray(step.notify) ? step.notify : []
-            if (!notifyStep.length) fail(`${stepWhere}.notify must name one or more sinks`)
-            if (new Set(notifyStep).size !== notifyStep.length) fail(`${stepWhere}.notify must not contain duplicates`)
-            for (const sink of notifyStep) if (!sinks[sink]) fail(`${stepWhere}.notify references unknown sink "${sink}"`)
+            const listed = stringList(step.notify, `${where}: ${stepWhere}.notify`, problems, save)
+            if (!listed.length) fail(`${stepWhere}.notify must name one or more sinks`)
+            if (new Set(listed).size !== listed.length) fail(`${stepWhere}.notify must not contain duplicates`)
+            // A step left with no known channel on load still gates escalation; it just sends nothing.
+            const notifyStep = knownSinks(listed, (sink) => `${where}: ${stepWhere}.notify references unknown sink "${sink}"`)
             if (after !== null) {
               if (stepIndex === 0 && after !== 0) fail('escalation[0].after must be 0s')
               if (after <= previous) fail(`${stepWhere}.after must be strictly greater than the previous step`)
@@ -999,24 +1087,19 @@ export function normalizeConfig(config: StatusPingConfig): NormalizedConfig {
     problems.push(`peer.healthMonitor: "${peer.healthMonitor}" must be an http monitor`)
   }
 
-  const maxConfirmationsPerTick = config.limits?.maxConfirmationsPerTick ?? 6
-  if (!Number.isInteger(maxConfirmationsPerTick) || maxConfirmationsPerTick < 1 || maxConfirmationsPerTick > 35) {
-    problems.push('limits.maxConfirmationsPerTick must be a whole number from 1 to 35')
-  }
-  const pingPerIpPerMinute = config.limits?.pingPerIpPerMinute ?? 60
-  if (!Number.isInteger(pingPerIpPerMinute) || pingPerIpPerMinute < 1 || pingPerIpPerMinute > 10_000) {
-    problems.push('limits.pingPerIpPerMinute must be a whole number from 1 to 10000')
-  }
+  const limitsInput = config.limits && typeof config.limits === 'object' ? config.limits : undefined
+  const bounded = (key: keyof typeof LIMIT_BOUNDS, fallback: number) =>
+    boundedNumber(limitsInput?.[key], fallback, `limits.${key}`, LIMIT_BOUNDS[key], problems, save, true, options.warnings)
   const limits = {
-    maxChecksPerTick: config.limits?.maxChecksPerTick ?? 35,
-    tickBudgetMs: config.limits?.tickBudgetMs ?? 20_000,
-    maxConfirmationsPerTick: config.limits?.maxConfirmationsPerTick ?? 6,
-    pingPerIpPerMinute,
+    maxChecksPerTick: bounded('maxChecksPerTick', 35),
+    tickBudgetMs: bounded('tickBudgetMs', 20_000),
+    maxConfirmationsPerTick: bounded('maxConfirmationsPerTick', 6),
+    pingPerIpPerMinute: bounded('pingPerIpPerMinute', 60),
   }
 
-  const access = normalizeAccess(config.access, problems)
-  const pages = normalizePages(config, monitors, access, problems)
-  const maintenance = normalizeMaintenance(config.maintenance, monitors, timezone, problems)
+  const access = normalizeAccess(config.access, problems, save, options.warnings)
+  const pages = normalizePages(config, monitors, access, problems, save, options.warnings)
+  const maintenance = normalizeMaintenance(config.maintenance, monitors, timezone, problems, save)
   const home = config.home ?? pages.find((p) => p.access === 'public')?.slug ?? null
   if (config.home && !pages.some((p) => p.slug === config.home)) problems.push(`home: unknown page "${config.home}"`)
 
@@ -1068,17 +1151,23 @@ function parseIsoTimestamp(value: unknown, where: string, problems: string[]): n
   return Math.floor(milliseconds / 1000)
 }
 
+/** The most maintenance windows a saved config may hold. */
+export const MAX_MAINTENANCE_WINDOWS = 200
+
 function normalizeMaintenance(
   input: StatusPingConfig['maintenance'],
   monitors: Monitor[],
   defaultTimezone: string,
   problems: string[],
+  save: boolean,
 ): NormalizedMaintenance[] {
   if (input === undefined) return []
   if (!Array.isArray(input)) {
     problems.push('maintenance: must be an array')
     return []
   }
+  // Every window is expanded on each status-page render and tick, so a saved list is capped.
+  if (save && input.length > MAX_MAINTENANCE_WINDOWS) problems.push(`maintenance: at most ${MAX_MAINTENANCE_WINDOWS} windows (found ${input.length}); remove past one-off windows`)
   const knownMonitors = new Map(monitors.map((monitor, order) => [monitor.id, order]))
   const normalized: NormalizedMaintenance[] = []
 
@@ -1139,7 +1228,7 @@ function normalizeMaintenance(
       continue
     }
     if (hasRecurringField) {
-      const schedule = typeof window.schedule === 'string' ? window.schedule : ''
+      const schedule = typeof window.schedule === 'string' ? normalizeSchedule(window.schedule) : ''
       if (!schedule) problems.push(`${where}.schedule: must be a non-empty cron expression`)
       const tz = typeof window.tz === 'string' ? window.tz : defaultTimezone
       if (!isValidTimeZone(tz)) problems.push(`${where}.tz: unknown timezone "${tz}"`)
@@ -1158,6 +1247,9 @@ function normalizeMaintenance(
         } catch (error) {
           problems.push(`${where}.schedule: invalid cron expression "${schedule}": ${(error as Error).message}`)
         }
+        // A stored window that breaks this still loads; rendering skips it if it overflows.
+        const cadence = save ? recurringScheduleProblem(schedule, isValidTimeZone(tz) ? tz : 'UTC') : null
+        if (cadence) problems.push(`${where}.schedule: "${schedule}" ${cadence}`)
       }
       if (!title || !ids.length || !schedule || !duration || duration <= 0 || !isValidTimeZone(tz)) continue
       normalized.push({ kind: 'recurring', title, monitors: ids, excludeFromUptime, schedule, tz, duration })
@@ -1173,6 +1265,8 @@ function normalizePages(
   monitors: Monitor[],
   access: NormalizedAccess | null,
   problems: string[],
+  save = false,
+  warnings?: string[],
 ): NormalizedPage[] {
   const inputs: PageInput[] = config.pages === undefined ? [
     { slug: 'status', title: config.title, description: config.description, access: 'public', monitors: ['*'] },
@@ -1207,12 +1301,14 @@ function normalizePages(
     if (p.access && p.access !== 'public') {
       if (!access) problems.push(`${where}: restricted access requires an \`access.provider\` config`)
       const sso = access?.provider.type === 'oidc'
-      const match = normalizeMatch(p.access, `${where}: access`, sso, problems)
-      const teams = p.access.teams ?? []
-      for (const t of teams) if (access && !access.teams[t]) problems.push(`${where}: unknown team "${t}"`)
-      if (!match.emails.length && !match.groups.length && !teams.length) {
+      const match = normalizeMatch(p.access, `${where}: access`, sso, problems, save)
+      const listed = stringList(p.access.teams, `${where}: access.teams`, problems, save)
+      if (!match.emails.length && !match.groups.length && !listed.length) {
         problems.push(`${where}: access must list emails${sso ? ', groups' : ''} or teams (or be 'public')`)
       }
+      // Before 0.3.12 a team named like an Object.prototype member ("constructor") resolved, so a
+      // stored page may list one. Loading drops it; the page stays restricted to whoever is left.
+      const teams = access ? knownTeams(listed, access.teams, where, problems, save, warnings) : listed
       pageAccess = { ...match, teams }
     }
     return {
@@ -1226,21 +1322,42 @@ function normalizePages(
   })
 }
 
+/** The listed teams that exist. An unknown one is refused when saving and dropped (with a warning) when loading. */
+function knownTeams(listed: string[], teams: Record<string, NormalizedMatch>, where: string, problems: string[], save: boolean, warnings?: string[]): string[] {
+  return listed.filter((team) => {
+    // Own keys only: "constructor" is not a team.
+    if (Object.prototype.hasOwnProperty.call(teams, team)) return true
+    const message = `${where}: unknown team "${team}"`
+    if (save) problems.push(message)
+    else warnings?.push(`${message} (left out)`)
+    return false
+  })
+}
+
 const EMAIL_PATTERN_RE = /^(\*|[^@\s*]+)@[^@\s*]+\.[^@\s*]+$/
 
-function normalizeMatch(input: MatchInput | undefined, where: string, sso: boolean, problems: string[]): NormalizedMatch {
-  const emails = (input?.emails ?? []).map((e) => e.trim().toLowerCase())
+/**
+ * Emails must be strings (anything else always failed). The shape of the match and its groups are
+ * checked strictly on save only, since an older release stored them without these checks.
+ */
+function normalizeMatch(input: MatchInput | undefined, where: string, sso: boolean, problems: string[], save = false): NormalizedMatch {
+  if (save && input !== undefined && (input === null || typeof input !== 'object' || Array.isArray(input))) problems.push(`${where}: must be an object`)
+  const record = input && typeof input === 'object' ? input : undefined
+  const emails = stringList(record?.emails, `${where}.emails`, problems).map((e) => e.trim().toLowerCase())
   for (const e of emails) {
     if (!EMAIL_PATTERN_RE.test(e)) problems.push(`${where}: "${e}" is not an email or *@domain pattern`)
   }
-  const groups = input?.groups ?? []
+  const groups = stringList(record?.groups, `${where}.groups`, problems, save)
   if (groups.length && !sso) {
     problems.push(`${where}: groups are only available with SSO (provider "oidc"); use emails for basic / cloudflare-access`)
   }
   return { emails, groups }
 }
 
-function normalizeAccess(input: AccessInput | undefined, problems: string[]): NormalizedAccess | null {
+/** Names that could reach an object's prototype if used as a key of a map built from the configuration. */
+export const RESERVED_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype'])
+
+function normalizeAccess(input: AccessInput | undefined, problems: string[], save = false, warnings?: string[]): NormalizedAccess | null {
   if (!input) return null
   if (typeof input !== 'object' || !input.provider || typeof input.provider !== 'object') {
     problems.push('access: must contain a provider object')
@@ -1263,21 +1380,35 @@ function normalizeAccess(input: AccessInput | undefined, problems: string[]): No
   if (!['basic', 'cloudflare-access', 'oidc'].includes(p.type)) {
     problems.push(`access.provider: unknown type "${(p as { type: string }).type}"`)
   }
-  const teams: Record<string, NormalizedMatch> = {}
-  for (const [name, t] of Object.entries(input.teams ?? {})) {
-    teams[name] = normalizeMatch(t, `access.teams.${name}`, sso, problems)
+  // No prototype: a team name is only ever an own key, whatever the stored configuration says.
+  const teams: Record<string, NormalizedMatch> = Object.create(null) as Record<string, NormalizedMatch>
+  const validTeams = input.teams && typeof input.teams === 'object' && !Array.isArray(input.teams)
+  if (save && input.teams !== undefined && !validTeams) problems.push('access.teams: must be an object of named member lists')
+  for (const [name, t] of Object.entries(validTeams ? input.teams! : {})) {
+    // Before 0.3.21 a team named "__proto__" set the prototype of the team map. Saving refuses
+    // these names; loading an older stored configuration drops the team with a warning.
+    if (RESERVED_KEYS.has(name)) {
+      const message = `access.teams: "${name}" cannot be used as a team name`
+      if (save) problems.push(message)
+      else warnings?.push(`${message} (left out)`)
+      continue
+    }
+    teams[name] = normalizeMatch(t, `access.teams.${name}`, sso, problems, save)
   }
   let admins: NormalizedAccess['admins'] = null
   if (input.admins !== undefined) {
-    const match = normalizeMatch(input.admins, 'access.admins', sso, problems)
-    const adminTeams = input.admins.teams ?? []
-    for (const team of adminTeams) if (!teams[team]) problems.push(`access.admins: unknown team "${team}"`)
-    if (!match.emails.length && !match.groups.length && !adminTeams.length) {
+    const match = normalizeMatch(input.admins, 'access.admins', sso, problems, save)
+    // Non-string admin teams always failed (as unknown teams), so they are reported on load too.
+    const listedTeams = stringList(input.admins?.teams, 'access.admins.teams', problems)
+    if (!match.emails.length && !match.groups.length && !listedTeams.length) {
       problems.push(`access.admins: must list emails${sso ? ', groups' : ''} or teams`)
     }
+    // As for pages: a prototype-named team an older release accepted is dropped on load.
+    const adminTeams = knownTeams(listedTeams, teams, 'access.admins', problems, save, warnings)
     admins = { ...match, teams: adminTeams }
   }
-  return { provider: p, teams, sessionHours: input.sessionHours ?? 12, admins }
+  const sessionHours = boundedNumber(input.sessionHours, 12, 'access.sessionHours', SESSION_HOURS_BOUNDS, problems, save, false, warnings)
+  return { provider: p, teams, sessionHours, admins }
 }
 
 export function isEnvRef(value: unknown): value is EnvRef {
@@ -1309,7 +1440,8 @@ export function resolveConfigEnv(config: StatusPingConfig, getEnv: EnvGetter, le
           else if (lenient) url = `https://unset.invalid/${url.$env}`
           else throw new Error(`monitor "${m.id}": missing environment variable ${url.$env} for its url`)
         }
-        const headers: Record<string, string> = {}
+        // Own keys only: a header named "__proto__" stays a header, never the object's prototype.
+        const headers: Record<string, string> = Object.create(null) as Record<string, string>
         for (const [key, value] of Object.entries(m.headers ?? {})) {
           if (typeof value === 'string') { headers[key] = value; continue }
           const resolved = getEnv(value.$env)
@@ -1332,8 +1464,17 @@ export function activeMonitors(config: NormalizedConfig, role: Role): Monitor[] 
 
 export type EnvGetter = (name: string) => string | undefined
 
+/**
+ * StatusPing's own server secrets. No configuration may reference them with { $env }: a reference
+ * in a webhook header or monitor URL would send the value to an address the config chooses.
+ */
+const RESERVED_ENV = new Set(['SESSION_SECRET', 'ADMIN_TOKEN', 'ACK_SECRET', 'SUBSCRIBER_TOKEN_SECRET', 'TICK_SECRET', 'BASIC_AUTH_USERS', 'PING_TOKENS'])
+export const isReservedEnv = (name: string) => RESERVED_ENV.has(name) || name.startsWith('STATUSPING_') || name.startsWith('TURSO_')
+
 export function resolveSecret(value: Secret, getEnv: EnvGetter): string | undefined {
   if (typeof value === 'string') return value
+  // Defense in depth: the admin validator already refuses these names.
+  if (isReservedEnv(value.$env)) throw new Error(`${value.$env} is a server secret and cannot be referenced in the configuration`)
   const v = getEnv(value.$env)
   if (v === undefined || v === '') {
     if (value.optional) return undefined
@@ -1342,13 +1483,18 @@ export function resolveSecret(value: Secret, getEnv: EnvGetter): string | undefi
   return v
 }
 
-/** Parses the PING_TOKENS secret: JSON object of `{ monitorId: token }`. */
+/**
+ * Parses the PING_TOKENS secret: JSON object of `{ monitorId: token }`. The map has no prototype:
+ * before 0.3.22 a push monitor named after an Object.prototype member ("constructor",
+ * "toString", …) with no entry here read a native function from the map, and its public string
+ * form became the monitor's ping token. Read it with own-key lookups (`own` in util/own.ts) all the same.
+ */
 export function parsePingTokens(raw: string | undefined): Record<string, string> {
-  if (!raw) return {}
+  if (!raw) return nullProtoRecord<string>()
   try {
     const parsed = JSON.parse(raw) as unknown
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      return Object.fromEntries(
+      return nullProtoRecord(
         Object.entries(parsed as Record<string, unknown>).filter(
           (e): e is [string, string] => typeof e[1] === 'string' && e[1].length >= 16,
         ),

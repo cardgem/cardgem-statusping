@@ -6,13 +6,15 @@
  */
 import { acknowledgeIncident } from '../acknowledgements.ts'
 import type { MaintenanceInput, PageInput, SinkInput } from '../config.ts'
-import { type Deps, storedEnvKey } from '../deps.ts'
-import { describeChanges, type Form, FormError, pageFromForm, pageList, putPage, putSink, removePage, removeSink, SINK_FIELDS, type SinkType, sinkEnvName, sinkFromForm } from '../admin/forms.ts'
+import type { Deps } from '../deps.ts'
+import { describeChanges, type Form, FormError, pageFromForm, pageList, putPage, putSink, removePage, removeSink, SINK_FIELDS, type SinkType, sinkFromForm } from '../admin/forms.ts'
+import { collidingChannel, forgetChannelStatements } from '../admin/channel-credentials.ts'
 import type { AdminConfig } from '../admin/security.ts'
 import { currentRevision, currentYamlText, listAudit, rotatePingToken, type SaveOptions, sendSinkTest } from '../admin/service.ts'
 import { parseAdminYaml, stringifyAdminYaml } from '../admin/yaml.ts'
 import { checkForUpdate } from '../updates.ts'
 import { isValidTimeZone, nowSeconds } from '../util/time.ts'
+import { hasOwn, own } from '../util/own.ts'
 import { APP_VERSION } from '../version.ts'
 import type { ApiToken } from './tokens.ts'
 import { at, iso, type Json, str, type Tool, ToolError } from './tool.ts'
@@ -172,7 +174,9 @@ export function adminTools({ deps, storedConfig, save, actor }: Ctx): Tool[] {
         const config = await storedConfig()
         const name = at(args.name)
         if (!/^[A-Za-z0-9_-]{1,40}$/.test(name)) throw new ToolError('Use 1–40 letters, numbers, - or _ for the channel name.')
-        if (config.sinks?.[name]) throw new ToolError(`A channel named "${name}" already exists.`)
+        if (hasOwn(config.sinks, name)) throw new ToolError(`A channel named "${name}" already exists.`)
+        const close = collidingChannel(config, name)
+        if (close) throw new ToolError(`The name "${name}" is too close to the channel "${close}". Choose a different name.`)
         const settings = (args.settings && typeof args.settings === 'object' ? args.settings : {}) as Json
         const { sink, secrets } = formErrors(() => sinkFromForm({ ...settingsForm(settings), type: at(args.type) }, name, undefined))
         await save(token, putSink(config, name, sink), secrets)
@@ -186,7 +190,7 @@ export function adminTools({ deps, storedConfig, save, actor }: Ctx): Tool[] {
       run: async (args, { token }) => {
         const config = await storedConfig()
         const name = at(args.name)
-        const existing = config.sinks?.[name]
+        const existing = own(config.sinks, name)
         if (!existing) throw new ToolError(`No channel named "${name}".`)
         const settings = (args.settings && typeof args.settings === 'object' ? args.settings : {}) as Json
         const { sink, secrets } = formErrors(() => sinkFromForm({ ...channelForm(existing), ...settingsForm(settings) }, name, existing))
@@ -201,10 +205,12 @@ export function adminTools({ deps, storedConfig, save, actor }: Ctx): Tool[] {
       run: async (args, { token }) => {
         const config = await storedConfig()
         const name = at(args.name)
-        if (!config.sinks?.[name]) throw new ToolError(`No channel named "${name}".`)
-        await save(token, removeSink(config, name))
-        const prefix = storedEnvKey(sinkEnvName(name, ''))
-        await deps.db.run(`DELETE FROM instance_secrets WHERE substr(name, 1, ?) = ?`, [prefix.length, prefix])
+        const sink = own(config.sinks, name)
+        if (!sink) throw new ToolError(`No channel named "${name}".`)
+        const remaining = removeSink(config, name)
+        await save(token, remaining)
+        // Erase the credentials this channel stored, by exact name.
+        await deps.db.batch(forgetChannelStatements(name, sink.type, remaining))
         return { deleted: name }
       },
     },
@@ -238,7 +244,7 @@ export function adminTools({ deps, storedConfig, save, actor }: Ctx): Tool[] {
     },
     {
       name: 'add_maintenance', scope: 'monitors', annotations: { title: 'Add maintenance window', readOnlyHint: false, destructiveHint: false },
-      description: 'Plan maintenance: give start and end (ISO 8601) for a one-off window, or schedule (cron), duration and optional tz for a recurring one. Affected monitors show maintenance instead of an outage.',
+      description: 'Plan maintenance: give start and end (ISO 8601) for a one-off window, or schedule (five-field cron, runs at least an hour apart), duration and optional tz for a recurring one. Affected monitors show maintenance instead of an outage.',
       inputSchema: { type: 'object', required: ['title', 'monitors'], properties: {
         title: str, monitors: { description: 'Monitor ids, or "*" for every monitor.', anyOf: [strings, { type: 'string', enum: ['*'] }] },
         start: str, end: str, schedule: str, duration: { ...str, description: 'Such as 30m or 2h.' }, tz: str,
@@ -291,7 +297,7 @@ export function adminTools({ deps, storedConfig, save, actor }: Ctx): Tool[] {
       run: async () => {
         const config = await storedConfig()
         const p = config.access?.provider
-        const update = await checkForUpdate({ db: deps.db, config: deps.config, fetch: deps.fetch, now: nowSeconds() })
+        const update = await checkForUpdate({ db: deps.db, config: deps.config, fetch: deps.fetch, targetGuard: deps.targetGuard, now: nowSeconds() })
         return {
           title: config.title, baseUrl: config.baseUrl, timezone: config.timezone ?? 'UTC', updateChecks: config.updates?.enabled === true,
           administrators: config.access?.admins?.emails ?? [], signInMethod: p ? (p.type === 'oidc' ? { type: 'oidc', issuer: p.issuer } : p.type === 'cloudflare-access' ? { type: 'cloudflare-access', teamDomain: p.teamDomain } : { type: 'basic' }) : null,
@@ -337,7 +343,7 @@ export function adminTools({ deps, storedConfig, save, actor }: Ctx): Tool[] {
       description: 'Check the signed StatusPing release manifest for a newer version now.',
       inputSchema: { type: 'object', properties: {} },
       run: async (_args, { token }) => {
-        const result = await checkForUpdate({ db: deps.db, config: deps.config, fetch: deps.fetch, now: nowSeconds(), force: true })
+        const result = await checkForUpdate({ db: deps.db, config: deps.config, fetch: deps.fetch, targetGuard: deps.targetGuard, now: nowSeconds(), force: true })
         await deps.db.run(`INSERT INTO audit_log (actor, action, target, before_json, after_json, at) VALUES (?, 'update.check', ?, NULL, NULL, ?)`, [actor(token), result.targetVersion ? `release:${result.targetVersion}` : 'release:none', nowSeconds()])
         return { installed: APP_VERSION, result: result.result, availableVersion: result.targetVersion, checkedAt: iso(result.checkedAt) }
       },
