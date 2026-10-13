@@ -2,8 +2,11 @@ import type { StatusPingConfig } from '../config.ts'
 import type { Db, Statement } from '../db/types.ts'
 import { createSink, type SinkRuntime } from '../notify/sinks.ts'
 import { randomToken, sha256Hex } from '../util/crypto.ts'
+import { own } from '../util/own.ts'
 import { type AdminConfig, validateAdminConfig } from './security.ts'
+import { ChannelCredentialError, channelBindingStatements, channelNameProblems } from './channel-credentials.ts'
 import { parseAdminYaml } from './yaml.ts'
+import { pruneLocalUsersStatement } from '../auth/local-users.ts'
 
 export interface StoredAdminConfig {
   config: AdminConfig
@@ -144,11 +147,17 @@ export async function loadAdminConfig(db: Db): Promise<StoredAdminConfig | null>
   return config ? { config, updatedAt: row.updated_at, updatedBy: row.updated_by } : null
 }
 
+/** An audit row as a statement, for writing in the same transaction as the change; values redacted like {@link appendAudit}. */
+export function auditStatement(entry: Omit<AuditEntry, 'id'>): Statement {
+  return {
+    sql: `INSERT INTO audit_log (actor, action, target, before_json, after_json, at) VALUES (?, ?, ?, ?, ?, ?)`,
+    params: [entry.actor, entry.action, entry.target, entry.before === null ? null : JSON.stringify(redactAdminValue(entry.before)), entry.after === null ? null : JSON.stringify(redactAdminValue(entry.after)), entry.at],
+  }
+}
+
 export async function appendAudit(db: Db, entry: Omit<AuditEntry, 'id'>): Promise<void> {
-  await db.run(
-    `INSERT INTO audit_log (actor, action, target, before_json, after_json, at) VALUES (?, ?, ?, ?, ?, ?)`,
-    [entry.actor, entry.action, entry.target, entry.before === null ? null : JSON.stringify(redactAdminValue(entry.before)), entry.after === null ? null : JSON.stringify(redactAdminValue(entry.after)), entry.at],
-  )
+  const { sql, params } = auditStatement(entry)
+  await db.run(sql, params)
 }
 
 export async function listAudit(db: Db, limit = 100): Promise<AuditEntry[]> {
@@ -166,6 +175,17 @@ export interface SaveOptions {
   /** The YAML text the change came from, kept so comments and ordering survive. */
   yaml?: string | null
   action?: string
+  /** SINK_ credentials entered with this save; they are bound to their channel's destination. */
+  entered?: readonly string[]
+  /** Whether a name is a real Worker secret / environment variable (unbound), not a stored value. */
+  hasRealEnv?: (name: string) => boolean
+  /**
+   * SINK_ credentials typed in with this save. They are checked as if stored and written in the
+   * same batch as the configuration, so a refused or failed save stores nothing.
+   */
+  secrets?: ReadonlyArray<{ name: string; value: string }>
+  /** More statements that must be written in the same transaction as the configuration. */
+  extra?: readonly Statement[]
 }
 
 /** Atomically validates, records, and stores an admin-managed config as a new revision. */
@@ -177,9 +197,20 @@ export async function saveAdminConfig(
   getEnv: (name: string) => string | undefined,
   opts: SaveOptions = {},
 ): Promise<StoredAdminConfig & { revision: number }> {
-  const { config } = validateAdminConfig(value, getEnv)
+  // A value entered for a name that is also a real Worker secret / environment variable is not
+  // stored: the real one wins, and a stale stored copy would silently take over if the operator
+  // later deleted the Worker secret.
+  const secrets = (opts.secrets ?? []).filter((s) => !opts.hasRealEnv?.(s.name))
+  const pending = new Map(secrets.map((s) => [s.name, s.value]))
+  const env = pending.size
+    ? (name: string) => (opts.hasRealEnv?.(name) ? getEnv(name) : pending.get(name) ?? getEnv(name))
+    : getEnv
+  const { config, normalized } = validateAdminConfig(value, env)
   if (config.admin !== true) throw new Error('admin: cannot disable admin mode through the admin API')
   const before = await loadAdminConfig(db)
+  const nameProblems = channelNameProblems(config, before?.config)
+  if (nameProblems.length) throw new ChannelCredentialError(nameProblems)
+  const bindings = await channelBindingStatements(db, config, before?.config, { getEnv: env, hasRealEnv: opts.hasRealEnv, entered: opts.entered, pending, now })
   if (opts.base !== undefined) {
     const current = await currentRevision(db)
     if (current !== opts.base) throw new RevisionConflict(current)
@@ -187,6 +218,14 @@ export async function saveAdminConfig(
   const action = opts.action ?? 'config.save'
   try {
     await db.batch([
+      ...secrets.map(({ name, value }) => ({
+        sql: `INSERT INTO instance_secrets (name, value, created_at) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET value = excluded.value, created_at = excluded.created_at`,
+        params: [`env:${name}`, value, now],
+      })),
+      ...secrets.map(({ name }) => ({
+        sql: `INSERT INTO audit_log (actor, action, target, before_json, after_json, at) VALUES (?, 'setting.store', ?, NULL, NULL, ?)`,
+        params: [actor, name, now],
+      })),
       ...revisionStatements(config, actor, now, { action, yaml: matchingYaml(opts.yaml, config), base: opts.base }),
       {
         sql: `INSERT INTO admin_config (id, config_json, updated_at, updated_by) VALUES (1, ?, ?, ?)
@@ -198,6 +237,12 @@ export async function saveAdminConfig(
         // Activity keeps its long-standing config.save, except for whole-file replacements.
         params: [actor, action === 'config.import' || action === 'config.restore' ? action : 'config.save', before ? JSON.stringify(redactAdminValue(before.config)) : null, JSON.stringify(redactAdminValue(config)), now],
       },
+      ...bindings,
+      ...(opts.extra ?? []),
+      // Passwords stored in the site belong to administrators: those of anyone this configuration
+      // does not make an administrator (all of them when it does not use email + password) go in
+      // the same transaction, whichever path changed the administrators (v0.3.20).
+      pruneLocalUsersStatement(normalized.access),
     ])
   } catch (error) {
     if (opts.base !== undefined && isConflict(error)) throw new RevisionConflict(await currentRevision(db))
@@ -232,7 +277,7 @@ export async function sendSinkTest(
   fetchFn: typeof fetch,
   runtime: SinkRuntime = {},
 ): Promise<void> {
-  const sinkConfig = config.sinks?.[name]
+  const sinkConfig = own(config.sinks, name)
   if (!sinkConfig) throw new Error(`unknown sink "${name}"`)
   const sink = createSink(name, sinkConfig, getEnv, runtime)
   await sink.send({

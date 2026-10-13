@@ -101,6 +101,20 @@ listed for you to apply; they are never overwritten.
   it. Revert the upgrade, then wait for a fixed release (StatusPing ships a
   repair migration rather than editing the failed one). Error responses never
   include configuration or secret values.
+- **The stored configuration no longer loads:** a release never refuses, on load, a
+  configuration an earlier release accepted: a setting that is now refused when saving (such as a
+  `defaults.notify` entry naming a channel that does not exist) is left out or clamped and listed
+  in a Settings banner. If the configuration still cannot be loaded, StatusPing uses the newest
+  earlier version from Configuration → History that loads, and Settings says so. That version
+  never widens access: sign-in, administrators and status pages (with their access rules) still
+  come from the stored configuration, and monitors or alert channels deleted since stay deleted.
+  If none loads that way, only the sign-in settings are used and no checks run until you fix or
+  import a configuration. Either way `/healthz` answers `ok: false` with `config: "fallback"` or
+  `"sign-in-only"`, the tick summary lists `config` in `failedPhases`, and Settings, sign-in,
+  `/setup/recover` and `/setup/reset` stay available. If even the sign-in settings cannot be
+  loaded, nobody can sign in and `/setup/recover` cannot check who is an administrator: use
+  `/setup/reset`. If the database cannot be read at all before a
+  configuration has loaded, pages answer 503 rather than serving an unconfigured site.
 - **`npm run upgrade` refuses to run:** it names the reason, such as local
   changes, an edited updater-owned file, or a release that requires an
   intermediate version first. Nothing is written until every check passes.
@@ -125,7 +139,7 @@ updates:
   enabled: true
 ```
 
-That checks the latest official release and verifies it with the StatusPing release public key, `3xn8vX3YomCYw2coJQIRYWQqwX8vrIblDE2CAcSPuWI=`. A mirror can set `manifestUrl` (HTTPS, with no credentials, query parameters, or fragment) and, if it re-signs releases, `publicKey`. The Worker refuses unsigned, altered, malformed, or incompatible manifests, and stores only the result, version, and check time, never the manifest body.
+That checks the latest official release and verifies it with the StatusPing release public key, `3xn8vX3YomCYw2coJQIRYWQqwX8vrIblDE2CAcSPuWI=`. A mirror can set `manifestUrl` (HTTPS, with no credentials, query parameters, or fragment) and, if it re-signs releases, `publicKey`. The Worker refuses unsigned, altered, malformed, or incompatible manifests, and stores only the result, version, and check time, never the manifest body. With `STATUSPING_BLOCK_PRIVATE_TARGETS=true` (always on for hosted tenants), a custom `manifestUrl` and `publicKey` are ignored: the check always uses the official manifest and key, and the request and its redirects go through the private-address guard.
 
 Checks are off by default, so an installation never contacts GitHub unless an operator enables them. The admin page checks at most once every 24 hours and offers a deliberate **Check for updates** action; an available release links to its public release notes and never changes the Worker or sends installation details.
 
@@ -143,9 +157,13 @@ Every YAML import is parsed as safe plain data, validated by the StatusPing conf
 
 Credentials are named, never written: webhook URLs and header values, HTTP monitor URLs and header values, and every channel credential accept `{ $env: NAME }`. A literal URL or header that carries a credential is refused. **Settings → Configuration** lists every `$env` name the configuration uses and whether it is set.
 
+A channel credential saved in Settings or through MCP (`SINK_<CHANNEL>_<FIELD>`) stays with the destination it was entered for: the ntfy or Gotify server, the Matrix homeserver, or the SMTP server and username. A save that points the channel somewhere else, from YAML, the API or MCP, is refused until the credential is entered again. Credentials set as Worker secrets or environment variables are not tied to a destination. The ntfy server must be an `https://` URL. A new channel's name may not differ from an existing one only in case or in `-`, `_` and `.`, because their stored credentials would share names.
+
 Every save is kept as a version (the newest 50). **Configuration → History** shows who changed what, a line diff against the current version, and **Restore**. If someone else saved after you opened a page, your save is refused with a note instead of overwriting their change. Exported YAML starts with a `# yaml-language-server: $schema=…` line pointing at `/admin/schema.json` ([`statusping.schema.json`](statusping.schema.json), generated from the config types with `npm run schema:generate`), so editors validate and complete it. Validation errors name the line.
 
-Automation uses the same API with `ADMIN_TOKEN`: `GET /api/admin/config` returns JSON, or YAML with `Accept: application/yaml`, and an `ETag` with the revision; `PUT` accepts either, and with `If-Match: "<revision>"` it answers 412 when the configuration changed since. From a checkout:
+The **Import** form at `/admin/import` takes a configuration of up to 1 MiB from a signed-in browser (a session cookie or a verified Cloudflare Access token). A script that posts to `/admin/import` with an `Authorization: Basic` header gets the 16 KiB limit of public forms, because checking a password before reading the body would cost a slow hash for every request; scripts, and large configurations in particular, should use `PUT /api/admin/config` with `ADMIN_TOKEN` instead.
+
+Automation uses the same API with `ADMIN_TOKEN`: `GET /api/admin/config` returns JSON, or YAML with `Accept: application/yaml`, and an `ETag` with the revision; `PUT` accepts either, and with `If-Match: "<revision>"` it answers 412 when the configuration changed since. Like an import, `PUT` keeps the current sign-in method (`access.provider`); change it in Settings → Access → **Change sign-in method**. From a checkout:
 
 ```bash
 npm run cli -- config check statusping.yaml                         # validate offline
@@ -155,9 +173,28 @@ ADMIN_TOKEN=… npm run cli -- config push --url https://status.example.com --re
 
 Scheduled jobs no longer need `PING_TOKENS`: adding one in Settings (or through MCP) shows its ping URL once, and Settings → Monitors marks any job that has none yet.
 
+**Email subscribers** (`subscribers`) on a restricted page: a subscriber is only an email address, so updates go only to addresses the page's access rules list now, in `emails` or in a team's `emails` (patterns such as `*@example.com` count). Access given only through single sign-on `groups` cannot be checked for an email address, so those people cannot subscribe and receive nothing; list their address or domain to include them. Making a public page private, or removing an address from its rules, stops that page's updates to subscribers it no longer lists; their subscriptions are kept and resume if access is given back.
+
 ## Change the sign-in method
 
-Settings → Access → **Change sign-in method** switches between email and password, Cloudflare Access and OpenID Connect without taking the site offline. You enter the new settings, then run a real test sign-in as an administrator; the current method keeps working until that succeeds and you choose **Switch**. Switching signs everyone else out.
+Settings → Access → **Change sign-in method** switches between email and password, Cloudflare Access and OpenID Connect without taking the site offline. You enter the new settings, then run a real test sign-in as an administrator; the current method keeps working until that succeeds and you choose **Switch**. Switching signs everyone else out, also when the new method is the same kind as the old one (a new password, another OpenID Connect issuer, another Access team) and also with `SESSION_SECRET` set; recovery sessions end too. Acknowledgement links in alerts already sent and MCP access tokens keep working (revoke tokens under Settings → MCP).
+
+A change belongs to the administrator who started it: only they can edit, test and switch it. Other administrators see who started it and when, and can cancel it to start their own. The audit log records who started each switch. If the test sign-in was made as a different address than yours (possible with single sign-on), switching signs you out too, and you sign in again with the new method.
+
+**Email and password: which password counts.** A password stored in the site (chosen in the setup wizard or under **Change sign-in method**, generated by `POST /api/setup`, or by `npm run cli -- recover`) takes precedence over a `BASIC_AUTH_USERS` entry for the same address. `BASIC_AUTH_USERS` is used only for addresses with no stored password. Before v0.3.19 it was the other way round, so a password set in the site had no effect for an address the secret also listed. When you set a password for an address that `BASIC_AUTH_USERS` lists, StatusPing says that the entry is now ignored: remove it from the secret.
+
+**Stored passwords belong to administrators.** Since v0.3.20 a stored password works only while its address is an administrator (listed in `access.admins`, directly, by an `*@domain` pattern or through an administrator team) and the site signs in with email and password. Removing someone from the administrators deletes their stored password in the same save, whether you do it in Settings, through MCP, the configuration API, an import or a restore. Switching to Cloudflare Access or OpenID Connect deletes every stored password, and switching back to email and password keeps only the password of the administrator who switches. Changing or removing a `BASIC_AUTH_USERS` entry does **not** revoke a stored password for that address, because the stored one takes precedence: remove it under Settings → Access → **Passwords stored in the site** (another administrator removes yours), or on Node with `npm run cli -- remove-user someone@example.com`. That list also says when a `BASIC_AUTH_USERS` entry is ignored for an address. Once the stored password is gone, a `BASIC_AUTH_USERS` entry for the same address signs it in again, with administrator access if it is still an administrator; both ways of removing a password warn about this, so remove or rotate that entry too. Removing a password does not end a session that is already signed in; it lasts until it expires.
+
+For OpenID Connect, the current client ID and secret (saved in Settings or set as Worker secrets) are offered only while the issuer stays the same. A new issuer needs them entered again; with Worker secrets, enter the same values to confirm them, or update the secrets first.
+
+**Verified email.** A sign-in counts only when the ID token says `email_verified: true`. A token without the claim counts as unverified. Microsoft Entra ID does not send it, so for Entra (and providers you run yourself, such as Pocket ID) tick **Accept emails this provider has not verified** (`trustUnverifiedEmail: true`).
+
+**Server-side requests to the issuer.** Whoever runs setup or this switch can make StatusPing
+fetch the issuer they enter (`/.well-known/openid-configuration`, then its `token_endpoint` and
+`jwks_uri`) from the server. All three must be `https://` URLs (`http://localhost` is allowed for
+development). With `STATUSPING_BLOCK_PRIVATE_TARGETS=true` (always on for hosted tenants),
+issuers and endpoints on private addresses are refused too; see
+[Monitoring private addresses](#monitoring-private-addresses).
 
 ## Connect AI assistants (MCP)
 
@@ -172,7 +209,7 @@ With the browser admin enabled, StatusPing is also a remote [MCP](https://modelc
 
 Resetting the site, changing the sign-in method and creating MCP tokens stay in the browser.
 
-The token is shown once and only its hash is stored; revoke it in the same place. For Claude Code:
+The token is shown once and only its hash is stored; revoke it in the same place. Resetting the site to the setup wizard revokes every token. For Claude Code:
 
 ```bash
 claude mcp add --transport http statusping https://<your-site>/mcp --header "Authorization: Bearer <token>"
@@ -190,7 +227,14 @@ you create in the browser:
    STATUSPING_RESET_TOKEN`; Node: add it to `.env` and restart).
 2. Open `/setup/reset`, enter the token, and type `reset`. The site switches to setup mode:
    every page shows "being set up", `/healthz` reports `"setup": "required"`, and no checks run.
-   Everyone is signed out. The previous configuration and all monitor history are kept.
+   Everyone is signed out, MCP access tokens are revoked, and acknowledgement links in alerts
+   already sent stop working. This holds when `SESSION_SECRET`, `STATUSPING_RECOVERY_TOKEN` or
+   `ACK_SECRET` are set too: what they sign is tied to a value that a reset, and again a finished
+   setup, replaces. **Ping URLs of scheduled jobs** (push monitors) created in Settings or by
+   setup are revoked too, even when the next configuration reuses the monitor id: after setup,
+   create a new one for each job (Settings → Monitors marks them "No ping URL yet") and update
+   the jobs that call them. Tokens from the `PING_TOKENS` secret are not affected. The previous
+   configuration, all monitor history and email subscribers are kept.
 3. Open `/setup` and enter the **setup code**. StatusPing writes it to the logs every minute
    while setup is pending (Cloudflare: the Worker's **Logs**, or `npx wrangler tail`). To choose
    your own code instead, set the `STATUSPING_SETUP_TOKEN` secret.
@@ -211,19 +255,44 @@ you create in the browser:
 Scripts can do steps 3–5 in one call: `POST /api/setup` with JSON `{ "code": "<setup code>",
 "admin": "you@example.com", "yaml": "<configuration>" }`. The sign-in method comes from the
 YAML's `access.provider` (email + password when absent; the response then contains a generated
-password, shown once). Cloudflare Access needs `CF_ACCESS_AUD`, and OpenID Connect needs
+password, shown once). `pingUrlsNeeded` in the response lists the scheduled jobs that still need
+a ping URL. Cloudflare Access needs `CF_ACCESS_AUD`, and OpenID Connect needs
 `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET` and a reachable issuer, before the call.
 
 **Locked out?** Set the `STATUSPING_RECOVERY_TOKEN` secret, open `/setup/recover`, and enter
 it with an administrator's email. That session can only change the sign-in method (Settings →
 Access); everything else stays closed until you switch, and the recovery is recorded in
 Activity. Remove the secret afterwards. On Node, `npm run cli -- recover you@example.com`
-switches the site to email + password and prints a new password.
+switches the site to email + password, signs everyone else out and prints a new password.
+
+**Acknowledgement links** in escalation alerts are signed with the `ACK_SECRET` secret when it
+is set, otherwise with a key the site generates and keeps in its database. Setting, changing or
+removing `ACK_SECRET` switches keys, so links in alerts already sent stop working (each link
+expires after 24 hours anyway); acknowledge those incidents from the monitor page instead. A
+reset and a finished setup make links already sent stop working in the same way, whether they
+were signed with `ACK_SECRET` or the generated key.
 
 After setup, the configuration lives in the database and is edited in Settings or as YAML.
 Passwords chosen in the wizard are stored as
-PBKDF2-SHA256 (50,000 iterations, which fits the Workers free plan's CPU limit), and password
-sign-in is limited to 10 attempts per minute per address.
+PBKDF2-SHA256 (50,000 iterations, which fits the Workers free plan's CPU limit).
+
+Guessing is rate limited per clock minute:
+
+- **Password sign-in** (the form and `Authorization: Basic`): 10 attempts per address, and 10
+  failed attempts per account from any address. Basic auth counts only failures, so scripts
+  making many authenticated calls are never limited. A limited request gets a 429 ("Too many
+  attempts") until the minute ends; a session cookie keeps working.
+- **Setup code** (`/setup/claim` and `/api/setup` together) and **reset token**: 5 attempts per
+  address. **Recovery token**: 5 attempts per address.
+- When StatusPing cannot see client addresses (Node without `STATUSPING_TRUST_PROXY=true`),
+  each of these uses one bucket shared by everyone, with a higher limit (30 sign-ins, 10
+  setup, reset or recovery attempts a minute). Someone flooding it can delay sign-in by a
+  minute at a time but cannot guess faster; put a proxy in front and set
+  `STATUSPING_TRUST_PROXY=true` to get per-address limits.
+
+The setup code (`XXXX-XXXX-XXXX`, about 60 bits) is never replaced because of wrong guesses,
+so nobody can invalidate the code you read from the logs; after every 100 wrong codes in a row
+a warning is logged.
 
 ## Use your own domain
 
@@ -261,9 +330,27 @@ status.example.com {
 ```
 
 Point an `A`/`AAAA` record for `status.example.com` at that machine. Set
-`STATUSPING_TRUST_PROXY=true` so ping rate limits see visitors' real IPs from
-`X-Forwarded-For`. Only set it when the proxy is the sole way in, since a
-direct client could otherwise spoof the header.
+`STATUSPING_TRUST_PROXY=true` so ping and sign-in rate limits see visitors' real IPs from
+`X-Forwarded-For`. StatusPing uses the **last** entry of that header, the address your proxy
+saw: proxies such as Caddy and nginx (`$proxy_add_x_forwarded_for`) add it at the end, and anything
+before it was sent by the client. This assumes exactly one proxy in front of StatusPing; behind
+a chain (a CDN, then your proxy), have the outer proxy's address replaced with the client's
+by the inner one (for example nginx `real_ip_header`/`set_real_ip_from`), or every visitor
+shares the CDN's address. Only set it when the proxy is the sole way in, since a direct
+client could otherwise spoof the header.
+
+#### Monitoring private addresses
+
+On Node, HTTP and TCP monitors may check internal services (`localhost`, `10.0.0.5`, a
+LAN host name), so anyone who can edit monitors (an administrator, or an MCP token with the
+`monitors` scope) can make the server connect to those addresses and read back the status,
+latency and error. If that is not what you want, set `STATUSPING_BLOCK_PRIVATE_TARGETS=true`.
+Monitors and OpenID Connect discovery then refuse loopback, private (RFC 1918), link-local
+(including the `169.254.169.254` cloud metadata address), unique-local IPv6, `0.0.0.0/8` and
+CGNAT (`100.64.0.0/10`) addresses, including IPv4-mapped IPv6 forms. Host names are resolved
+first and every address is checked; HTTP redirects are followed (at most 5) and each hop is
+checked again. A refused check fails with `target address is private (blocked)`. The guard is
+always on for hosted tenants. Cloudflare Workers cannot reach private addresses at all.
 
 ### Hosted on statusp.ing
 
@@ -273,14 +360,18 @@ Custom domain** at `app.statusp.ing`:
 1. Enter the domain, such as `status.example.com`, and choose **Connect domain**.
 2. At your DNS provider, add a `CNAME` record from `status` to `cname.statusp.ing`.
    With Cloudflare DNS, leave the record **DNS only** (grey cloud).
-3. StatusPing checks every minute and shows **Connected** once the name resolves
-   and its certificate is issued. **Check now** checks at once.
-4. Update **Address** in the site's Settings as above. The `<name>.statusp.ing`
+3. Add the `TXT` record shown on the page: name `_statusping-challenge.status`
+   (in full, `_statusping-challenge.status.example.com`) with the value shown. It
+   proves the domain is yours. Keep it while the domain is connected: StatusPing
+   checks it daily, and if it goes missing the domain stops working after 3 days.
+4. StatusPing checks every minute and shows **Live** once the name resolves, its
+   certificate is issued and the `TXT` record is found. **Check now** checks at once.
+5. Update **Address** in the site's Settings as above. The `<name>.statusp.ing`
    address keeps working.
 
 A domain at the zone apex (`example.com` itself) needs a DNS provider that supports
 CNAME flattening or `ALIAS` records; a subdomain is simpler. If a domain shows
-**Could not connect**, check its record, remove it, and add it again. If the
+**Could not connect**, check its records and choose **Check now**. Someone else's unproven claim on your domain doesn't block you: adding it and publishing your `TXT` record takes it over. If the
 domain has `CAA` records, they must allow one of the certificate authorities
 Cloudflare uses (Let's Encrypt, Google Trust Services or SSL.com).
 
@@ -306,6 +397,10 @@ variables below, and none of this applies to them.
   policy and a secret, these routes do not exist.
 - A new tenant that has `STATUSPING_SETUP_TOKEN` set starts in the setup
   wizard. Its owner claims it with that token.
+- Monitors and OpenID Connect discovery refuse private addresses, as with
+  `STATUSPING_BLOCK_PRIVATE_TARGETS=true` (see
+  [Monitoring private addresses](#monitoring-private-addresses)); a tenant
+  cannot turn this off.
 
 ## Run on Node and use an independent confirmation peer
 

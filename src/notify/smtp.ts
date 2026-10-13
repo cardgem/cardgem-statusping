@@ -3,6 +3,7 @@
  * (port 587), AUTH PLAIN or LOGIN, one message per connection. Plaintext delivery is not
  * supported, so credentials never cross the network unencrypted.
  */
+import { hasControlChars, isEmailAddress, parseMailbox, quoteDisplayName } from '../util/email.ts'
 
 /** A connected byte stream. Runtime adapters (Workers sockets, Node net/tls) implement it. */
 export interface SmtpSocket {
@@ -47,9 +48,14 @@ const wrap = (value: string) => value.replace(/.{1,76}/g, '$&\r\n')
 export const mailboxAddress = (mailbox: string) => (/<([^<>]+)>\s*$/.exec(mailbox)?.[1] ?? mailbox).trim()
 /** Header-safe display text: RFC 2047 encoded when it is not plain ASCII. */
 const headerText = (value: string) => (/^[\x20-\x7e]*$/.test(value) ? value : `=?UTF-8?B?${b64(value)}?=`)
+/**
+ * The From header: a non-ASCII display name is RFC 2047 encoded (an encoded word needs no
+ * quoting); an ASCII one is quoted when it holds specials such as `,` or `:`.
+ */
 const headerMailbox = (mailbox: string) => {
-  const match = /^\s*"?([^"<]*?)"?\s*<([^<>]+)>\s*$/.exec(mailbox)
-  return match && match[1] ? `${headerText(match[1])} <${match[2]}>` : mailboxAddress(mailbox)
+  const { name, address } = parseMailbox(mailbox)
+  if (!name) return address
+  return `${/^[\x20-\x7e]*$/.test(name) ? quoteDisplayName(name) : headerText(name)} <${address}>`
 }
 
 /** Builds a multipart/alternative RFC 5322 message with base64 bodies (so no line is ever too long). */
@@ -129,6 +135,10 @@ class Conversation {
 
 /** Sends one message. Errors never include the password. */
 export async function sendSmtp(connect: SmtpConnector, settings: SmtpSettings, msg: SmtpMessage): Promise<void> {
+  // Configuration validation already refuses these; this keeps a bad address from ever reaching
+  // an SMTP command line or a header, whatever path it arrived by.
+  if (hasControlChars(msg.from) || !isEmailAddress(mailboxAddress(msg.from))) throw new SmtpError('smtp: the sender is not a valid email address')
+  for (const to of msg.to) if (!isEmailAddress(mailboxAddress(to))) throw new SmtpError('smtp: a recipient is not a valid email address')
   let socket: SmtpSocket | undefined
   let timer: ReturnType<typeof setTimeout> | undefined
   const session = async () => {

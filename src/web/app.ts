@@ -1,13 +1,15 @@
 import { Hono } from 'hono'
+import { readCappedText, readTruncatedText } from '../util/capped-body.ts'
+import { BODY_LIMITS, bodyLimit, bodyLimitFor, capDependsOnCredentials, verifiedCredentials } from './body-limit.ts'
 import type { Context } from 'hono'
-import { currentViewer, hasCredentials, mountAuthRoutes, sameOrigin, signInResponse } from '../auth/providers.ts'
-import { type Viewer, canAcknowledge, canOpen } from '../auth/viewer.ts'
-import { acknowledgeIncident, verifyAcknowledgeToken } from '../acknowledgements.ts'
+import { currentViewer, hasCredentials, mountAuthRoutes, fromThisSite, signInResponse } from '../auth/providers.ts'
+import { type Viewer, canAcknowledge, canOpen, mayEmailAbout } from '../auth/viewer.ts'
+import { acknowledgeIncident, acknowledgeSecret, verifyAcknowledgeToken } from '../acknowledgements.ts'
 import type { NormalizedPage } from '../config.ts'
 import type { Deps } from '../deps.ts'
 import { dispatchNotifications } from '../notify/dispatch.ts'
 import { dispatchAnnouncementNotifications, enqueueAnnouncementNotifications } from '../notify/announcements.ts'
-import { MAX_PING_BODY, handlePing, parseSignal } from '../ping.ts'
+import { MAX_PING_BODY_BYTES, handlePing, parseSignal, pushMonitorForToken } from '../ping.ts'
 import { ensureSchema } from '../schema.ts'
 import { tick } from '../tick.ts'
 import { timingSafeEqual } from '../util/crypto.ts'
@@ -25,15 +27,19 @@ import { mountMcp } from '../mcp/server.ts'
 import { mountAccessSwitchAuthRoutes } from '../admin/access-switch.ts'
 import { mountSetupAuthRoutes, mountSetupRoutes, SETUP_AUTH_PATHS } from '../setup/routes.ts'
 import { mountRecoveryRoutes } from '../setup/recovery.ts'
-import { consumePingRateLimit } from '../rate-limit.ts'
+import { attemptBucket, consumePingRateLimit } from '../rate-limit.ts'
+import { HTTPException } from 'hono/http-exception'
 import { runHttpCheck } from '../evaluate/http.ts'
 import { runTcpCheck } from '../evaluate/tcp.ts'
+import { targetFetch, targetTcpConnect } from '../util/private-targets.ts'
 import { PLATFORM_SECRET_ENV, PLATFORM_SIGNATURE_HEADER, verifyPlatformRequest } from '../platform.ts'
 import { exportTenantData } from '../export.ts'
 
 const STALE_TICK_SECONDS = 180
 /** Signed hosted-platform routes; they answer in setup mode too (tick and export handle it). */
 const PLATFORM_PATHS = ['/internal/tick', '/internal/export']
+/** Answered even when no configuration could be loaded at all (see the first middleware). */
+const CONFIG_INDEPENDENT_PATHS = ['/healthz', '/setup/recover', '/setup/reset']
 const PUBLIC_MAX_AGE = 30
 
 type Cacheable = { cacheable: boolean }
@@ -80,15 +86,61 @@ function runAfterResponse(c: Context, deps: Deps, p: Promise<unknown>) {
   }
 }
 
+/**
+ * The acknowledgement page's URL is a bearer capability: it must not leak through a Referer header
+ * (the page loads a stylesheet and links back to the site) or be indexed by a crawler.
+ */
+const ACK_HEADERS = { 'cache-control': 'no-store', 'referrer-policy': 'no-referrer', 'x-robots-tag': 'noindex' }
+
+const CONFIRM_BODY_LIMIT = 1024
+/**
+ * Pings from clients whose address the adapter cannot tell (Node without STATUSPING_TRUST_PROXY)
+ * share one bucket. It is generous so a fleet of cron jobs behind it is never throttled in
+ * practice, yet it still bounds the work an anonymous flood can cause.
+ */
+const UNKNOWN_IP_PING_LIMIT = 600
+/** Pings a known push monitor may still record per minute once the shared bucket is used up. */
+export const PER_MONITOR_PING_LIMIT = 60
+
 export function createApp(deps: Deps): Hono {
   const app = new Hono()
   let config = deps.config
+
+  /**
+   * Whether a real configuration (or the setup state) has loaded in this isolate. A deployed site
+   * starts with only the unconfigured placeholder; a configuration passed in directly (tests, an
+   * old config-as-code site) is validated when the deps are created.
+   */
+  let configSettled = !deps.fromDatabase
+  /** The last attempt to load it failed before anything had loaded: /healthz reports it. */
+  let configUnavailable = false
+
   // An admins list also needs a sign-in affordance on otherwise-public monitor pages.
   let hasRestricted = config.pages.some((p) => p.access !== 'public') || Boolean(config.access?.admins)
 
   app.use('*', async (c, next) => {
     await ensureSchema(deps.db)
-    await refreshAdminConfig(deps, nowSeconds())
+    try {
+      await refreshAdminConfig(deps, nowSeconds(), new URL(c.req.url).origin)
+      configSettled = true
+      configUnavailable = false
+    } catch (error) {
+      // A stored configuration that cannot be loaded falls back inside refreshAdminConfig; anything
+      // else that goes wrong here (the database, say) must still not take Settings, sign-in and
+      // reset down with it once a configuration has loaded: the site keeps the configuration it
+      // last loaded and tries again on the next request.
+      deps.log('error', 'loading the configuration failed', { error: (error as Error).message })
+      if (!configSettled) {
+        // Nothing has loaded in this isolate, so deps.config is only the unconfigured placeholder,
+        // with no access rules: serving pages from it could show a restricted site to anyone.
+        // Fail closed, except for the health check, reset, and /setup/recover (which explains that it
+        // cannot help until the sign-in settings load).
+        configUnavailable = true
+        if (!CONFIG_INDEPENDENT_PATHS.includes(c.req.path)) {
+          return c.text('This StatusPing site cannot load its configuration right now. Try again shortly.', 503, { 'cache-control': 'no-store', 'x-robots-tag': 'noindex', 'retry-after': '30' })
+        }
+      }
+    }
     // Setup mode: only the health check and the wizard respond until setup is finished. Page
     // visits (most likely the owner) go straight to the wizard; pings and API calls get a 503.
     if (deps.setupPending && c.req.path !== '/healthz' && c.req.path !== '/api/setup' && !PLATFORM_PATHS.includes(c.req.path) && c.req.path !== '/setup' && !c.req.path.startsWith('/setup/') && !SETUP_AUTH_PATHS.includes(c.req.path)) {
@@ -105,7 +157,20 @@ export function createApp(deps: Deps): Hono {
     await next()
   })
 
+  // Cap every request body before anything parses it (see body-limit.ts); /ping caps its own.
+  // It runs after the setup check above (which reads no body) so the cap knows whether setup is
+  // pending: only then may an anonymous client send a whole configuration to the setup routes.
+  // Credentials are verified (not just present) before a configuration route gets the larger cap.
+  app.use('*', bodyLimit(async (method, path, c) => {
+    const context = { setupPending: deps.setupPending }
+    const cautious = bodyLimitFor(method, path, context)
+    if (cautious === BODY_LIMITS.config || !capDependsOnCredentials(method, path)) return cautious
+    return bodyLimitFor(method, path, { ...context, credentials: await verifiedCredentials(c, deps) })
+  }))
+
   app.onError((err, c) => {
+    // A deliberate response from deep inside a handler, such as the 429 for a rate-limited Basic header.
+    if (err instanceof HTTPException) return err.getResponse()
     deps.log('error', 'request failed', { path: c.req.path, error: err.message })
     return c.text('Internal error', 500)
   })
@@ -116,22 +181,32 @@ export function createApp(deps: Deps): Hono {
     if (!signal) return c.text('Unknown signal', 400)
     // A suspended hosted tenant runs no monitoring, pings included.
     if (deps.tenant?.suspended) return c.text('Monitoring is suspended', 503, { 'cache-control': 'no-store', 'retry-after': '3600' })
-    let body: string | null = null
-    if (c.req.method === 'POST' || c.req.method === 'PUT') {
-      const text = await c.req.text()
-      body = text ? text.slice(0, MAX_PING_BODY) : null
-    }
     const now = nowSeconds()
     const ip = deps.clientIp(c.req.raw)
-    if (ip && !(await consumePingRateLimit(deps.db, ip, now, config.limits.pingPerIpPerMinute))) {
+    const bucket = ip ? { key: ip, limit: config.limits.pingPerIpPerMinute } : attemptBucket('ping', null, 0, Math.max(UNKNOWN_IP_PING_LIMIT, config.limits.pingPerIpPerMinute))
+    let allowed = await consumePingRateLimit(deps.db, bucket.key, now, bucket.limit)
+    if (!allowed && !ip) {
+      // The shared unknown-address bucket is used up, possibly by a flood of made-up tokens. A
+      // ping whose token belongs to a push monitor still counts against that monitor's own
+      // allowance, so anonymous traffic cannot starve real pings; unknown tokens stay refused.
+      const monitorId = await pushMonitorForToken(deps, c.req.param('token') ?? '')
+      if (monitorId) allowed = await consumePingRateLimit(deps.db, `ping:monitor:${monitorId}`, now, PER_MONITOR_PING_LIMIT)
+    }
+    if (!allowed) {
       return c.text('Too many requests', 429, { 'cache-control': 'no-store', 'retry-after': String(60 - (now % 60)) })
     }
+    // The body is read only once the token matches a push monitor, and only its first
+    // MAX_PING_BODY_BYTES: a longer body is truncated, not refused, because pings are stored
+    // truncated anyway and a cron job piping a long log must still record its signal.
+    const readBody = c.req.method === 'POST' || c.req.method === 'PUT'
+      ? async () => (await readTruncatedText(c.req.raw, MAX_PING_BODY_BYTES)) || null
+      : null
     const outcome = await handlePing(
       deps,
       c.req.param('token') ?? '',
       signal,
       {
-        body,
+        body: readBody,
         ip,
         userAgent: c.req.header('user-agent') ?? null,
       },
@@ -162,6 +237,15 @@ export function createApp(deps: Deps): Hono {
       // While setup is pending no checks run, yet the deployment is healthy (plan 011 D4).
       if (deps.setupPending) {
         return c.json({ ok: true, setup: 'required', version: APP_VERSION, schemaVersion: SCHEMA_VERSION, channel, templateVersion, instanceId, role: deps.role, lastTickAt: last, lagSeconds: lag }, 200, {
+          'cache-control': 'no-store',
+          'access-control-allow-origin': '*',
+        })
+      }
+      // A configuration that does not load (an earlier saved version or only the sign-in settings
+      // in use, or nothing loaded at all) is an unhealthy site even while ticks keep running.
+      const config = configUnavailable ? 'unavailable' : deps.configFallback ? (deps.configFallback.revision === null ? 'sign-in-only' : 'fallback') : undefined
+      if (config) {
+        return c.json({ ok: false, config, version: APP_VERSION, schemaVersion: SCHEMA_VERSION, channel, templateVersion, instanceId, role: deps.role, lastTickAt: last, lagSeconds: lag }, 503, {
           'cache-control': 'no-store',
           'access-control-allow-origin': '*',
         })
@@ -216,17 +300,21 @@ export function createApp(deps: Deps): Hono {
     if (!secret || !deps.location) return c.text('Not found', 404)
     if (!timingSafeEqual(c.req.header('authorization') ?? '', `Bearer ${secret}`)) return c.text('Unauthorized', 401, { 'cache-control': 'no-store' })
     const length = Number(c.req.header('content-length') ?? 0)
-    if (!Number.isFinite(length) || length > 1024) return c.text('Bad request', 400, { 'cache-control': 'no-store' })
+    if (!Number.isFinite(length) || length > CONFIRM_BODY_LIMIT) return c.text('Bad request', 400, { 'cache-control': 'no-store' })
+    // Content-Length is absent on a chunked request, so the read itself is capped too.
+    const text = await readCappedText(c.req.raw, CONFIRM_BODY_LIMIT)
     let body: unknown
-    try { body = await c.req.json() } catch { return c.text('Bad request', 400, { 'cache-control': 'no-store' }) }
+    try { body = text === null ? null : JSON.parse(text) } catch { body = null }
+    if (body === null) return c.text('Bad request', 400, { 'cache-control': 'no-store' })
     const monitorId = body && typeof body === 'object' && !Array.isArray(body) ? (body as Record<string, unknown>).monitorId : undefined
     if (typeof monitorId !== 'string' || monitorId.length > 120) return c.text('Bad request', 400, { 'cache-control': 'no-store' })
     const monitor = config.monitors.find((item) => item.id === monitorId)
     if (!monitor || (monitor.kind !== 'http' && monitor.kind !== 'tcp')) return c.text('Not found', 404, { 'cache-control': 'no-store' })
+    const tcpConnect = targetTcpConnect(deps)
     const result = monitor.kind === 'http'
-      ? await runHttpCheck(monitor, deps.fetch)
-      : deps.tcpConnect
-        ? await runTcpCheck(monitor, deps.tcpConnect)
+      ? await runHttpCheck(monitor, targetFetch(deps))
+      : tcpConnect
+        ? await runTcpCheck(monitor, tcpConnect)
         : { ok: false, err: 'TCP checks are not configured in this runtime' }
     return c.json({ location: deps.location, ok: result.ok, err: result.err }, 200, { 'cache-control': 'no-store' })
   })
@@ -317,14 +405,17 @@ export function createApp(deps: Deps): Hono {
     const r = await openPage(c, c.req.param('slug'))
     if (r instanceof Response) return r
     if (!config.subscribers) return c.text('Not found', 404)
-    if (!sameOrigin(c, deps)) return c.text('Invalid origin', 403)
+    if (!fromThisSite(c, deps)) return c.text('Invalid origin', 403)
     const form = await c.req.parseBody().catch(() => ({}))
     // A restricted-page subscription belongs to the authenticated viewer, never a form field.
     const email = r.page.access === 'public' ? String((form as Record<string, string | File>).email ?? '') : r.viewer!.email
-    const bucket = c.req.header('cf-connecting-ip') ? `ip:${c.req.header('cf-connecting-ip')}` : `page:${r.page.slug}`
+    // The adapter's trusted client address, never a raw header: on Node anyone can send cf-connecting-ip.
+    const ip = deps.clientIp(c.req.raw)
+    const bucket = ip ? `ip:${ip}` : `page:${r.page.slug}`
     if (!(await consumeSubscribeLimit(deps.db, bucket, nowSeconds()))) return c.text('Too many subscription attempts; try again later.', 429)
     const result = await startSubscription(deps, r.page.slug, email, nowSeconds())
     if (result === 'invalid') return c.text('Enter a valid email address.', 400)
+    if (result === 'not-allowed') return c.text('Email updates for this page go only to addresses listed in its access rules. Ask an administrator to add yours.', 403)
     return c.redirect(`/pages/${encodeURIComponent(r.page.slug)}?subscription=${result === 'confirmed' ? 'already-confirmed' : 'check-email'}`, 303)
   })
   app.get('/subscribe/confirm', async (c) => {
@@ -346,36 +437,37 @@ export function createApp(deps: Deps): Hono {
     page,
     fields: new Set(page.show),
     base: `/pages/${page.slug}`,
-    subscribersEnabled: Boolean(config.subscribers),
+    // On a restricted page only addresses its access rules list get updates (see mayEmailAbout).
+    subscribersEnabled: Boolean(config.subscribers) && (page.access === 'public' || (viewer !== null && mayEmailAbout(page, viewer.email, config.access))),
     canAcknowledge: canAcknowledge(viewer, config.access),
   })
 
   // Alert capability links are deliberately confirmed with a non-mutating GET. The token is
   // signed and expires, while acknowledgements.incident_id makes the POST single-use.
   app.get('/ack/:token', async (c) => {
-    const secret = deps.getEnv('ACK_SECRET')
-    if (!secret) return c.text('Not found', 404)
+    const secret = await acknowledgeSecret(deps, false)
+    if (!secret) return c.text('Not found', 404, ACK_HEADERS)
     const incidentId = await verifyAcknowledgeToken(c.req.param('token'), nowSeconds(), secret)
-    if (!incidentId) return c.text('Not found', 404)
+    if (!incidentId) return c.text('Not found', 404, ACK_HEADERS)
     const incident = await deps.db.first<{ monitor_id: string; name: string; resolved_at: number | null }>(
       `SELECT i.monitor_id, m.name, i.resolved_at FROM incidents i JOIN monitors m ON m.id = i.monitor_id WHERE i.id = ?`, [incidentId],
     )
-    if (!incident || incident.resolved_at !== null) return c.text('Not found', 404)
+    if (!incident || incident.resolved_at !== null) return c.text('Not found', 404, ACK_HEADERS)
     const chrome = await buildChrome(deps, { viewer: null, current: c.req.path })
-    return c.html(acknowledgePage(chrome, c.req.param('token'), incident.name), 200, { 'cache-control': 'no-store' })
+    return c.html(acknowledgePage(chrome, c.req.param('token'), incident.name), 200, ACK_HEADERS)
   })
   app.post('/ack', async (c) => {
-    const secret = deps.getEnv('ACK_SECRET')
-    if (!secret) return c.text('Not found', 404)
+    const secret = await acknowledgeSecret(deps, false)
+    if (!secret) return c.text('Not found', 404, ACK_HEADERS)
     const body = await c.req.parseBody()
     const token = typeof body.token === 'string' ? body.token : ''
     const incidentId = await verifyAcknowledgeToken(token, nowSeconds(), secret)
-    if (!incidentId) return c.text('Not found', 404)
+    if (!incidentId) return c.text('Not found', 404, ACK_HEADERS)
     const incident = await deps.db.first<{ monitor_id: string; resolved_at: number | null }>(`SELECT monitor_id, resolved_at FROM incidents WHERE id = ?`, [incidentId])
-    if (!incident || incident.resolved_at !== null) return c.text('Not found', 404)
+    if (!incident || incident.resolved_at !== null) return c.text('Not found', 404, ACK_HEADERS)
     const created = await acknowledgeIncident(deps.db, incidentId, 'alert-link', 'alert-link', nowSeconds())
     const chrome = await buildChrome(deps, { viewer: null, current: c.req.path })
-    return c.html(messagePage(chrome, created ? 'Incident acknowledged' : 'Already acknowledged', created ? 'Further escalation alerts have been stopped.' : 'This incident was already acknowledged.'), 200, { 'cache-control': 'no-store' })
+    return c.html(messagePage(chrome, created ? 'Incident acknowledged' : 'Already acknowledged', created ? 'Further escalation alerts have been stopped.' : 'This incident was already acknowledged.'), 200, ACK_HEADERS)
   })
 
   /** "Not found" page with the shared header/footer (personalized only if signed in). */
@@ -440,7 +532,7 @@ export function createApp(deps: Deps): Hono {
     if (r instanceof Response) return r
     const viewer = await currentViewer(c, deps)
     if (!canAcknowledge(viewer, config.access)) return c.text('Forbidden', 403)
-    if (!sameOrigin(c, deps)) return c.text('Forbidden', 403)
+    if (!fromThisSite(c, deps)) return c.text('Forbidden', 403)
     const id = c.req.param('id')
     if (!r.page.monitorIds.includes(id)) return c.text('Not found', 404)
     const monitor = config.monitors.find((candidate) => candidate.id === id)

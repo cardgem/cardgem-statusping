@@ -1,8 +1,10 @@
 import type { Deps } from '../deps.ts'
 import type { IncidentReason, MonitorStateRow } from '../state.ts'
 import { activeMaintenance } from '../maintenance.ts'
-import { createAcknowledgeToken } from '../acknowledgements.ts'
+import { acknowledgeSecret, createAcknowledgeToken } from '../acknowledgements.ts'
 import { formatDuration } from '../util/time.ts'
+import { clipText } from '../util/text.ts'
+import { own } from '../util/own.ts'
 import { type AlertMessage, createSink } from './sinks.ts'
 
 const MAX_ATTEMPTS = 3
@@ -230,7 +232,7 @@ export async function dispatchNotifications(deps: Deps, now: number, onlyMonitor
     }
 
     for (const { sinkName, event, messageKind, acknowledge } of targets) {
-      const sinkConfig = config.sinks[sinkName]
+      const sinkConfig = own(config.sinks, sinkName)
       if (!sinkConfig) continue
       const prev = known.get(key(incident.id, event, sinkName))
       if (prev && (prev.ok || prev.attempts >= MAX_ATTEMPTS)) continue
@@ -251,11 +253,13 @@ export async function dispatchNotifications(deps: Deps, now: number, onlyMonitor
       ])
       if (claim?.changes !== 1) continue // someone else is sending it
 
-      const acknowledgeUrl = acknowledge
-        ? `${config.baseUrl}/ack/${await createAcknowledgeToken(incident.id, now, deps.getEnv('ACK_SECRET')!)}`
-        : undefined
-      const message = buildMessage(deps, monitor.name, monitor.id, incident, messageKind, now, acknowledgeUrl)
       try {
+        // Inside the try: anything that fails after the claim (signing the link included) is
+        // recorded on the notification and retried, never thrown out of the dispatch loop.
+        const acknowledgeUrl = acknowledge
+          ? `${config.baseUrl}/ack/${await createAcknowledgeToken(incident.id, now, (await acknowledgeSecret(deps))!)}`
+          : undefined
+        const message = buildMessage(deps, monitor.name, monitor.id, incident, messageKind, now, acknowledgeUrl)
         await createSink(sinkName, sinkConfig, deps.getEnv, deps).send(message, deps.fetch)
         await db.run(`UPDATE notifications SET ok = 1, error = NULL WHERE incident_id = ? AND event = ? AND sink = ?`, [
           incident.id,
@@ -267,7 +271,7 @@ export async function dispatchNotifications(deps: Deps, now: number, onlyMonitor
         const error = (e as Error).message ?? String(e)
         deps.log('warn', 'notification failed', { sink: sinkName, monitor: monitor.id, event, error })
         await db.run(`UPDATE notifications SET error = ? WHERE incident_id = ? AND event = ? AND sink = ?`, [
-          error.slice(0, 500),
+          clipText(error || 'notification failed', 500),
           incident.id,
           event,
           sinkName,

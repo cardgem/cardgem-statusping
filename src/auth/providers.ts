@@ -1,15 +1,20 @@
 import type { Context, Hono } from 'hono'
+import { OIDC_MAX_RESPONSE_BYTES, readCappedJson } from '../util/capped-body.ts'
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie'
 import { type AuthProviderInput, resolveSecret } from '../config.ts'
 import type { Deps } from '../deps.ts'
-import { consumePingRateLimit } from '../rate-limit.ts'
+import { HTTPException } from 'hono/http-exception'
+import { attemptBucket, consumePingRateLimit, rateLimitExhausted } from '../rate-limit.ts'
 import { randomToken, sha256Hex, timingSafeEqual } from '../util/crypto.ts'
 import { nowSeconds } from '../util/time.ts'
-import { b64urlEncode, verifyJwt } from './jwt.ts'
+import { b64urlEncode, emailVerified, verifyJwt } from './jwt.ts'
 import { sign, unsign } from './session.ts'
+import { epochKey } from './epoch.ts'
+import { storedPasswordAllowed } from './local-users.ts'
 import { buildChrome } from '../web/chrome.ts'
-import { signInPage, ssoSignInPage } from '../web/pages.ts'
+import { signInPage, signOutPage, ssoSignInPage } from '../web/pages.ts'
 import { type Viewer, referencedGroups } from './viewer.ts'
+import { targetFetch } from '../util/private-targets.ts'
 
 const SESSION_COOKIE = 'sp_session'
 const LOGIN_COOKIE = 'sp_oidc'
@@ -17,10 +22,23 @@ const LOGIN_COOKIE = 'sp_oidc'
 type Oidc = Extract<AuthProviderInput, { type: 'oidc' }>
 type CfAccess = Extract<AuthProviderInput, { type: 'cloudflare-access' }>
 
-/** Only allow same-site relative redirects. */
+const NEXT_BASE = 'https://statusping.invalid'
+
+/**
+ * Only allow same-site relative redirects. Rejects control and whitespace characters (the URL
+ * parser strips tabs and newlines, so `/\t/evil.example` would otherwise become
+ * `//evil.example`), then resolves the path and returns it only if it stays on this origin.
+ */
 export function safeNext(next: string | undefined): string {
   if (!next || !next.startsWith('/') || next.startsWith('//') || next.startsWith('/\\')) return '/'
-  return next
+  if (/[\x00-\x20\x7f]/.test(next)) return '/'
+  let u: URL
+  try { u = new URL(next, NEXT_BASE) } catch { return '/' }
+  if (u.origin !== NEXT_BASE) return '/'
+  const out = u.pathname + u.search + u.hash
+  // A canonical path that starts `//` or `/\` would be read as protocol-relative by browsers.
+  if (out.startsWith('//') || out.startsWith('/\\')) return '/'
+  return out
 }
 
 // ── Basic ─────────────────────────────────────────────────────────────────────────────────────
@@ -73,38 +91,127 @@ export async function passwordMatches(password: string, entry: string): Promise<
   return false
 }
 
-/** Checks an email + password against BASIC_AUTH_USERS, then the accounts created by setup. */
+/** Parses BASIC_AUTH_USERS; null (and an error in the log, when given) if it is not a JSON object. */
+function basicAuthUsers(getEnv: (name: string) => string | undefined, log?: Deps['log']): Record<string, string> | null {
+  try {
+    const users: unknown = JSON.parse(getEnv('BASIC_AUTH_USERS') ?? '{}')
+    if (users && typeof users === 'object' && !Array.isArray(users)) return users as Record<string, string>
+  } catch { /* reported below */ }
+  log?.('error', 'BASIC_AUTH_USERS is not valid JSON')
+  return null
+}
+
+/** The BASIC_AUTH_USERS entry for an address (keys compare case-insensitively), if any. */
+function basicAuthEntry(users: Record<string, string>, email: string): string | undefined {
+  const entry = Object.entries(users).find(([k]) => k.toLowerCase() === email)?.[1]
+  return typeof entry === 'string' ? entry : undefined
+}
+
+/**
+ * Whether BASIC_AUTH_USERS lists this address. Used to tell an administrator who has just set a
+ * password in the site (setup, Change sign-in method, `cli recover`) that the env entry is now
+ * ignored for that address and should be removed. Pass a getter that reads only the real
+ * environment; BASIC_AUTH_USERS is never stored in the database anyway.
+ */
+export function basicAuthUsersLists(getEnv: (name: string) => string | undefined, rawEmail: string): boolean {
+  if (getEnv('BASIC_AUTH_USERS') === undefined) return false
+  const users = basicAuthUsers(getEnv)
+  return users !== null && basicAuthEntry(users, rawEmail.trim().toLowerCase()) !== undefined
+}
+
+/** The sentence shown when BASIC_AUTH_USERS still lists an address that now has a stored password. */
+export const basicAuthEnvIgnoredNote = (email: string) =>
+  `BASIC_AUTH_USERS still lists ${email}. That entry is now ignored for this address, because the password stored in the site takes precedence. Remove it from the BASIC_AUTH_USERS secret.`
+
+/**
+ * The warning shown when a stored password was removed (Settings → Access, `cli remove-user`) for
+ * an address that is still an administrator and that BASIC_AUTH_USERS lists: from then on that env
+ * entry signs the address in again, with administrator access, however old it is.
+ */
+export const basicAuthEnvAdminNote = (email: string) =>
+  `BASIC_AUTH_USERS lists ${email}, which is still an administrator, so that entry now signs it in with administrator access. Remove or rotate that entry in the BASIC_AUTH_USERS secret unless that is intended.`
+
+/**
+ * A fixed `pbkdf2-sha256` entry with the parameters of {@link hashUserPassword}. Checked when an
+ * address has no usable stored password, so every attempt costs one PBKDF2 derivation whether
+ * the address is unknown, listed in BASIC_AUTH_USERS (sha256) or stored in the site (round 20, F2:
+ * before, an unknown address returned in microseconds and a stored one took ~5 ms). No password
+ * matches it: the expected value is not the output of any derivation we know of, and the result is
+ * never used.
+ */
+const DUMMY_PASSWORD_HASH = `pbkdf2-sha256:${PBKDF2_ITERATIONS}:${'5a'.repeat(16)}:${'0'.repeat(64)}`
+
+/**
+ * Checks an email + password. A password stored in the site (local_users: setup, Change sign-in
+ * method, `cli recover`) wins; BASIC_AUTH_USERS is used only for an address with no usable stored
+ * password. Before v0.3.19 the env entry won, so a password set in the site had no effect for an
+ * address the secret also listed, and the old env password kept signing in.
+ *
+ * A stored password is usable only while the site signs in with email + password and the address
+ * is an administrator under the current configuration (v0.3.20). Saves that remove an administrator
+ * also delete their row (auth/local-users.ts), but this check holds whatever changed the
+ * administrators, including rows left by an earlier release. BASIC_AUTH_USERS entries are not
+ * limited to administrators: they are also how page viewers sign in.
+ *
+ * Timing: the database is read for every attempt, and every attempt runs one PBKDF2 derivation
+ * (against a dummy hash when the entry is missing or a fast sha256 one), so the time taken does
+ * not show whether an address exists or where its password comes from.
+ */
 export async function verifyPassword(deps: Deps, rawEmail: string, password: string): Promise<Viewer | null> {
   const email = rawEmail.trim().toLowerCase()
   if (!email || !password) return null
-  let users: Record<string, string>
-  try {
-    users = JSON.parse(deps.getEnv('BASIC_AUTH_USERS') ?? '{}')
-  } catch {
-    deps.log('error', 'BASIC_AUTH_USERS is not valid JSON')
-    return null
+  const stored = (await deps.db.first<{ password_hash: string }>(`SELECT password_hash FROM local_users WHERE email = ?`, [email]))?.password_hash
+  let entry = stored !== undefined && storedPasswordAllowed(deps.config.access, email) ? stored : undefined
+  if (entry === undefined) {
+    const users = basicAuthUsers(deps.getEnv, deps.log)
+    entry = users ? basicAuthEntry(users, email) : undefined
   }
-  const entry = Object.entries(users).find(([k]) => k.toLowerCase() === email)?.[1]
-    ?? (await deps.db.first<{ password_hash: string }>(`SELECT password_hash FROM local_users WHERE email = ?`, [email]))?.password_hash
+  if (!entry || !entry.startsWith('pbkdf2-sha256:')) await passwordMatches(password, DUMMY_PASSWORD_HASH)
   if (!entry) return null
   return (await passwordMatches(password, entry)) ? { email, groups: [], provider: 'basic' } : null
 }
 
+// ── Password attempt limits ──────────────────────────────────────────────────────────────────
+
+/** Password attempts per client address per minute (the sign-in form counts every attempt). */
+export const LOGIN_ATTEMPTS_PER_MINUTE = 10
+/** The shared bucket when the client address is unknown (Node without STATUSPING_TRUST_PROXY). */
+export const LOGIN_ATTEMPTS_UNKNOWN_CLIENT_PER_MINUTE = 30
+/** Failed password attempts per account per minute, from any address, form and Basic together. */
+export const LOGIN_FAILURES_PER_EMAIL_PER_MINUTE = 10
+const LOGIN_LIMITED = 'Too many attempts. Wait a minute and try again.'
+
+const loginBucket = (ip: string | null) => attemptBucket('login', ip, LOGIN_ATTEMPTS_PER_MINUTE, LOGIN_ATTEMPTS_UNKNOWN_CLIENT_PER_MINUTE)
+/** A bounded key for one account, whatever the address typed (hashed, so no email lands in the table). */
+const emailBucket = async (email: string) => `login-email:${(await sha256Hex(email.trim().toLowerCase())).slice(0, 32)}`
+
 /**
  * An `Authorization: Basic` header is still accepted for scripts and the JSON API (e.g.
  * `curl -u`). Browsers never send one because we never send a Basic challenge — people use the
- * sign-in form instead.
+ * sign-in form instead. Only failures count against the address and account limits, so a script
+ * making many authenticated calls is never limited; while a limit is used up the request gets
+ * a 429 and the password is not checked.
  */
 async function basicHeaderViewer(c: Context, deps: Deps): Promise<Viewer | null> {
   const header = c.req.header('authorization') ?? ''
   if (!header.startsWith('Basic ')) return null
-  try {
-    const decoded = atob(header.slice(6))
-    const i = decoded.indexOf(':')
-    return i < 0 ? null : verifyPassword(deps, decoded.slice(0, i), decoded.slice(i + 1))
-  } catch {
-    return null
+  let decoded: string
+  try { decoded = atob(header.slice(6)) } catch { return null }
+  const i = decoded.indexOf(':')
+  if (i < 0) return null
+  const email = decoded.slice(0, i)
+  const now = nowSeconds()
+  const byAddress = loginBucket(deps.clientIp(c.req.raw))
+  const byEmail = await emailBucket(email)
+  if (await rateLimitExhausted(deps.db, byAddress.key, now, byAddress.limit) || await rateLimitExhausted(deps.db, byEmail, now, LOGIN_FAILURES_PER_EMAIL_PER_MINUTE)) {
+    throw new HTTPException(429, { res: new Response(LOGIN_LIMITED, { status: 429, headers: { 'content-type': 'text/plain; charset=UTF-8', 'retry-after': '60', 'cache-control': 'no-store' } }) })
   }
+  const viewer = await verifyPassword(deps, email, decoded.slice(i + 1))
+  if (!viewer) {
+    await consumePingRateLimit(deps.db, byAddress.key, now, byAddress.limit)
+    await consumePingRateLimit(deps.db, byEmail, now, LOGIN_FAILURES_PER_EMAIL_PER_MINUTE)
+  }
+  return viewer
 }
 
 // ── Cloudflare Access ─────────────────────────────────────────────────────────────────────────
@@ -123,9 +230,35 @@ async function cloudflareViewer(c: Context, deps: Deps, p: CfAccess): Promise<Vi
     const email = typeof claims.email === 'string' ? claims.email.toLowerCase() : null
     return email ? { email, groups: [], provider: 'cloudflare-access' } : null
   } catch (e) {
-    deps.log('warn', 'Cloudflare Access token rejected', { error: (e as Error).message })
+    noteRejectedAccessToken(deps, (e as Error).message)
     return null
   }
+}
+
+/**
+ * Anyone can send a made-up Access token, so rejections are logged at most once a minute per
+ * reason (in this isolate), with the number left out since.
+ */
+const ACCESS_REJECT_LOG_INTERVAL_MS = 60 * 1000
+const accessRejections = new Map<string, { loggedAt: number; suppressed: number }>()
+
+function noteRejectedAccessToken(deps: Deps, reason: string): void {
+  // JwtError messages are fixed phrases, except an unsupported alg, which echoes the token header.
+  const key = reason.startsWith('unsupported alg') ? 'unsupported alg' : reason.slice(0, 80)
+  const now = Date.now()
+  const seen = accessRejections.get(key)
+  if (seen && now - seen.loggedAt < ACCESS_REJECT_LOG_INTERVAL_MS) {
+    seen.suppressed++
+    return
+  }
+  if (!seen && accessRejections.size >= 50) accessRejections.clear()
+  accessRejections.set(key, { loggedAt: now, suppressed: 0 })
+  deps.log('warn', 'Cloudflare Access token rejected', { error: key, ...(seen?.suppressed ? { similarSinceLastLog: seen.suppressed } : {}) })
+}
+
+/** For tests: log the next Access token rejection again. */
+export function clearAccessRejectionLog(): void {
+  accessRejections.clear()
 }
 
 // ── OIDC ──────────────────────────────────────────────────────────────────────────────────────
@@ -138,12 +271,34 @@ interface Discovery {
 }
 const discoveryCache = new Map<string, { doc: Discovery; expires: number }>()
 
-export async function discover(issuer: string, fetchFn: typeof fetch): Promise<Discovery> {
+/**
+ * An OIDC URL StatusPing fetches server-side: https only (plain http just for `localhost`
+ * development, matching the config rule, and never while the private-target guard is on), and on
+ * a public address when the guard is on.
+ */
+async function checkOidcUrl(value: unknown, field: string, deps: Pick<Deps, 'targetGuard'>): Promise<URL> {
+  let url: URL
+  try { url = new URL(String(value)) } catch { throw new Error(`${field} is not a valid URL`) }
+  const localDev = url.protocol === 'http:' && url.hostname === 'localhost' && !deps.targetGuard
+  if (url.protocol !== 'https:' && !localDev) throw new Error(`${field} must be an https:// URL`)
+  await deps.targetGuard?.(url.hostname)
+  return url
+}
+
+/**
+ * Reads `{issuer}/.well-known/openid-configuration`. The issuer, token_endpoint and jwks_uri are
+ * fetched server-side, so each must be https and, with the private-target guard on, public.
+ */
+export async function discover(issuer: string, deps: Pick<Deps, 'fetch' | 'targetGuard'>): Promise<Discovery> {
   const hit = discoveryCache.get(issuer)
   if (hit && hit.expires > Date.now()) return hit.doc
-  const res = await fetchFn(`${issuer.replace(/\/+$/, '')}/.well-known/openid-configuration`)
+  await checkOidcUrl(issuer, 'issuer', deps)
+  const res = await targetFetch(deps)(`${issuer.replace(/\/+$/, '')}/.well-known/openid-configuration`)
   if (!res.ok) throw new Error(`OIDC discovery failed: HTTP ${res.status}`)
-  const doc = (await res.json()) as Discovery
+  const doc = (await readCappedJson(res, OIDC_MAX_RESPONSE_BYTES)) as Discovery
+  if (!doc || typeof doc !== 'object') throw new Error('OIDC discovery returned no configuration')
+  await checkOidcUrl(doc.token_endpoint, 'token_endpoint', deps)
+  await checkOidcUrl(doc.jwks_uri, 'jwks_uri', deps)
   discoveryCache.set(issuer, { doc, expires: Date.now() + 3600_000 })
   return doc
 }
@@ -153,22 +308,32 @@ async function storedSessionKey(deps: Deps): Promise<string | null> {
   return (await deps.db.first<{ value: string }>(`SELECT value FROM instance_secrets WHERE name = 'session_key'`))?.value ?? null
 }
 
-async function sessionSecret(deps: Deps): Promise<string> {
+/**
+ * SESSION_SECRET bound to the secret epoch, or null when it is not set. A reset and a finished
+ * setup replace the epoch, so sessions signed before them stop verifying even though the operator
+ * secret is unchanged (see auth/epoch.ts; before a site's first epoch this is SESSION_SECRET itself).
+ */
+async function explicitSessionKey(deps: Deps): Promise<string | null> {
   const s = deps.getEnv('SESSION_SECRET')
-  if (s && s.length >= 32) return s
+  return s && s.length >= 32 ? epochKey(deps.db, s, 'session') : null
+}
+
+async function sessionSecret(deps: Deps): Promise<string> {
+  const explicit = await explicitSessionKey(deps)
+  if (explicit) return explicit
   const stored = await storedSessionKey(deps)
   if (stored) return stored
   throw new Error('SESSION_SECRET must be set (at least 32 characters) for SSO')
 }
 
 /**
- * Secret for signing session cookies: SESSION_SECRET, else the key setup stored in the DB.
+ * Secret for signing session cookies: SESSION_SECRET (bound to the secret epoch), else the key setup stored in the DB.
  * Basic finally falls back to a key derived from BASIC_AUTH_USERS (changing users or passwords
  * then signs everyone out).
  */
 async function cookieSecret(deps: Deps): Promise<string | null> {
-  const explicit = deps.getEnv('SESSION_SECRET')
-  if (explicit && explicit.length >= 32) return explicit
+  const explicit = await explicitSessionKey(deps)
+  if (explicit) return explicit
   const type = deps.config.access?.provider.type
   if (type !== 'basic' && type !== 'oidc') return null
   const stored = await storedSessionKey(deps)
@@ -180,26 +345,68 @@ async function cookieSecret(deps: Deps): Promise<string | null> {
 
 const secureCookies = (deps: Deps) => deps.config.baseUrl.startsWith('https://')
 
+/**
+ * Both cookies are signed with the same secret, so each says what it is: `kind` is checked on
+ * read, and a payload is used only if it has the shape its purpose needs. Without this the
+ * short-lived OIDC login cookie (`sp_oidc`, issued to anyone who opens /auth/login) verified as a
+ * session cookie. Sessions issued before `kind` existed carry no kind; they still load when they
+ * have a session's shape (every release has written email, groups and provider), and a login
+ * cookie never does (it has no email).
+ */
 interface SessionPayload {
+  kind: 'session'
   exp: number
   email: string
   groups: string[]
   provider: Viewer['provider']
 }
 
+interface LoginPayload {
+  kind: 'login'
+  exp: number
+  state: string
+  nonce: string
+  verifier: string
+  next: string
+}
+
+const VIEWER_PROVIDERS: ReadonlySet<string> = new Set<Viewer['provider']>(['basic', 'cloudflare-access', 'oidc'])
+
+/** A session cookie payload, or null when it is another kind of signed value or malformed. */
+export function sessionFromPayload(s: unknown): Viewer | null {
+  if (!s || typeof s !== 'object') return null
+  const p = s as Record<string, unknown>
+  if (p.kind !== undefined && p.kind !== 'session') return null
+  if (typeof p.email !== 'string' || !p.email) return null
+  if (!Array.isArray(p.groups) || !p.groups.every((g) => typeof g === 'string')) return null
+  if (typeof p.provider !== 'string' || !VIEWER_PROVIDERS.has(p.provider)) return null
+  return { email: p.email, groups: [...p.groups] as string[], provider: p.provider as Viewer['provider'] }
+}
+
+/** An OIDC login cookie payload, or null (a session cookie or anything else never qualifies). */
+function loginFromPayload(s: unknown): LoginPayload | null {
+  if (!s || typeof s !== 'object') return null
+  const p = s as Record<string, unknown>
+  // In-flight logins started before the upgrade carry no kind; they expire within ten minutes.
+  if (p.kind !== undefined && p.kind !== 'login') return null
+  if (p.email !== undefined) return null
+  for (const k of ['state', 'nonce', 'verifier', 'next'] as const) if (typeof p[k] !== 'string') return null
+  return { ...(p as unknown as LoginPayload), kind: 'login' }
+}
+
 async function sessionViewer(c: Context, deps: Deps, provider: Viewer['provider']): Promise<Viewer | null> {
   const secret = await cookieSecret(deps)
   if (!secret) return null
-  const s = await unsign<SessionPayload>(getCookie(c, SESSION_COOKIE), secret, nowSeconds())
-  if (!s || (s.provider ?? 'oidc') !== provider) return null
-  return { email: s.email, groups: s.groups, provider }
+  const viewer = sessionFromPayload(await unsign<{ exp: number }>(getCookie(c, SESSION_COOKIE), secret, nowSeconds()))
+  if (!viewer || viewer.provider !== provider) return null
+  return viewer
 }
 
 export async function setSession(c: Context, deps: Deps, viewer: Viewer): Promise<void> {
   const secret = await cookieSecret(deps)
   if (!secret) return
   const hours = deps.config.access?.sessionHours ?? 12
-  const payload: SessionPayload = { email: viewer.email, groups: viewer.groups, provider: viewer.provider, exp: nowSeconds() + hours * 3600 }
+  const payload: SessionPayload = { kind: 'session', email: viewer.email, groups: viewer.groups, provider: viewer.provider, exp: nowSeconds() + hours * 3600 }
   setCookie(c, SESSION_COOKIE, await sign({ ...payload }, secret), {
     httpOnly: true,
     secure: secureCookies(deps),
@@ -219,13 +426,13 @@ function oidcHandlers(deps: Deps, p: Oidc) {
   const redirectUri = `${deps.config.baseUrl}/auth/callback`
 
   const login = async (c: Context) => {
-    const d = await discover(p.issuer, deps.fetch)
+    const d = await discover(p.issuer, deps)
     const state = randomToken(32)
     const nonce = randomToken(32)
     const verifier = randomToken(64)
     const challenge = b64urlEncode(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier))))
     const next = safeNext(c.req.query('next'))
-    setCookie(c, LOGIN_COOKIE, await sign({ state, nonce, verifier, next, exp: nowSeconds() + 600 }, await sessionSecret(deps)), {
+    setCookie(c, LOGIN_COOKIE, await sign({ kind: 'login', state, nonce, verifier, next, exp: nowSeconds() + 600 } satisfies LoginPayload, await sessionSecret(deps)), {
       httpOnly: true,
       secure: secureCookies(deps),
       sameSite: 'Lax',
@@ -249,19 +456,15 @@ function oidcHandlers(deps: Deps, p: Oidc) {
   const callback = async (c: Context) => {
     const secret = await sessionSecret(deps)
     const now = nowSeconds()
-    const login = await unsign<{ exp: number; state: string; nonce: string; verifier: string; next: string }>(
-      getCookie(c, LOGIN_COOKIE),
-      secret,
-      now,
-    )
+    const login = loginFromPayload(await unsign<{ exp: number }>(getCookie(c, LOGIN_COOKIE), secret, now))
     deleteCookie(c, LOGIN_COOKIE, { path: '/auth' })
     const code = c.req.query('code')
     if (!login || !code || !timingSafeEqual(c.req.query('state') ?? '', login.state)) {
       return c.text('Sign-in failed or expired. Please try again.', 400)
     }
-    const d = await discover(p.issuer, deps.fetch)
+    const d = await discover(p.issuer, deps)
     const clientId = resolveSecret(p.clientId, deps.getEnv)!
-    const res = await deps.fetch(d.token_endpoint, {
+    const res = await targetFetch(deps)(d.token_endpoint, {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
       body: new URLSearchParams({
@@ -277,18 +480,19 @@ function oidcHandlers(deps: Deps, p: Oidc) {
       deps.log('warn', 'OIDC token exchange failed', { status: res.status })
       return c.text('Sign-in failed (token exchange).', 502)
     }
-    const { id_token } = (await res.json()) as { id_token?: string }
+    const { id_token } = (await readCappedJson(res, OIDC_MAX_RESPONSE_BYTES)) as { id_token?: string }
     if (!id_token) return c.text('Sign-in failed (no ID token).', 502)
     let claims: Record<string, unknown>
     try {
-      claims = await verifyJwt(id_token, { jwksUrl: d.jwks_uri, issuer: d.issuer, audience: clientId, fetch: deps.fetch, now })
+      claims = await verifyJwt(id_token, { jwksUrl: d.jwks_uri, issuer: d.issuer, audience: clientId, fetch: targetFetch(deps), now })
     } catch (e) {
       deps.log('warn', 'OIDC ID token rejected', { error: (e as Error).message })
       return c.text('Sign-in failed (invalid ID token).', 401)
     }
     if (claims.nonce !== login.nonce) return c.text('Sign-in failed (nonce mismatch).', 401)
     const email = typeof claims.email === 'string' ? claims.email.toLowerCase() : null
-    if (!email || (claims.email_verified === false && !p.trustUnverifiedEmail)) return c.text('Your account has no verified email address.', 403)
+    // A missing email_verified claim counts as unverified unless the provider is trusted.
+    if (!email || (!emailVerified(claims) && !p.trustUnverifiedEmail)) return c.text('Your account has no verified email address.', 403)
 
     // Keep only groups the config refers to: keeps the cookie small (Entra/Okta can send hundreds).
     const wanted = deps.config.access ? referencedGroups(deps.config.pages, deps.config.access) : new Set<string>()
@@ -304,12 +508,18 @@ function oidcHandlers(deps: Deps, p: Oidc) {
 
 // ── Email + password sign-in form ─────────────────────────────────────────────────────────────
 
-/** Rejects cross-site form posts (login CSRF): the Origin, if sent, must be this site. */
-export function sameOrigin(c: Context, deps: Deps): boolean {
-  const origin = c.req.header('origin')
-  if (!origin) return true
-  const allowed = new Set([new URL(c.req.url).origin, new URL(deps.config.baseUrl).origin])
-  return allowed.has(origin)
+/**
+ * Rejects cross-site form posts (CSRF): the request must say it came from this site. Browsers
+ * send Origin on every form POST; a Referer from this site is accepted as a fallback. A request
+ * with neither is refused, so a missing Origin is never taken as same-origin. Used by every
+ * cookie-authenticated POST, alongside a CSRF token where the form has one.
+ */
+export function fromThisSite(c: Context, deps: Deps): boolean {
+  let origin = c.req.header('origin')
+  if (!origin) {
+    try { origin = new URL(c.req.header('referer') ?? '').origin } catch { return false }
+  }
+  return new Set([new URL(c.req.url).origin, new URL(deps.config.baseUrl).origin]).has(origin)
 }
 
 function passwordHandlers(deps: Deps) {
@@ -329,13 +539,21 @@ function passwordHandlers(deps: Deps) {
     const next = safeNext(typeof form.next === 'string' ? form.next : undefined)
     const email = typeof form.email === 'string' ? form.email.trim() : ''
     const password = typeof form.password === 'string' ? form.password : ''
-    if (!sameOrigin(c, deps)) return page(c, { next, email, error: 'Please try again.' }, 403)
-    const ip = deps.clientIp(c.req.raw)
-    if (ip !== null && !(await consumePingRateLimit(deps.db, `login:${ip}`, nowSeconds(), 10))) {
-      return page(c, { next, email, error: 'Too many attempts. Wait a minute and try again.' }, 429)
+    if (!fromThisSite(c, deps)) return page(c, { next, email, error: 'Please try again.' }, 403)
+    // Every form attempt counts against the address (or the shared unknown-address bucket);
+    // failures also count against the account, so many addresses cannot guess one password.
+    const now = nowSeconds()
+    const byAddress = loginBucket(deps.clientIp(c.req.raw))
+    const byEmail = await emailBucket(email)
+    if (!(await consumePingRateLimit(deps.db, byAddress.key, now, byAddress.limit))
+      || await rateLimitExhausted(deps.db, byEmail, now, LOGIN_FAILURES_PER_EMAIL_PER_MINUTE)) {
+      return page(c, { next, email, error: LOGIN_LIMITED }, 429)
     }
     const viewer = await verifyPassword(deps, email, password)
-    if (!viewer) return page(c, { next, email, error: 'Incorrect email or password.' }, 401)
+    if (!viewer) {
+      await consumePingRateLimit(deps.db, byEmail, now, LOGIN_FAILURES_PER_EMAIL_PER_MINUTE)
+      return page(c, { next, email, error: 'Incorrect email or password.' }, 401)
+    }
     await setSession(c, deps, viewer)
     const res = c.redirect(next, 303)
     res.headers.set('cache-control', 'no-store')
@@ -354,6 +572,21 @@ export async function currentViewer(c: Context, deps: Deps): Promise<Viewer | nu
   if (p.type === 'basic') return basicViewer(c, deps)
   if (p.type === 'cloudflare-access') return cloudflareViewer(c, deps, p)
   return sessionViewer(c, deps, 'oidc')
+}
+
+/**
+ * A browser credential that verifies, without a database read beyond the stored session key and
+ * without checking a password: the signed `sp_session` cookie (email + password and SSO), or a
+ * Cloudflare Access token whose signature, issuer, audience and expiry check out. The JWKS is
+ * cached; a token naming an unknown key refetches it at most once a minute per JWKS URL (see
+ * JWKS_REFRESH_INTERVAL_MS), so forged tokens cannot turn into a key fetch each. An `Authorization:
+ * Basic` header is not counted: checking it costs a PBKDF2 derivation and a rate-limit write.
+ */
+export async function hasVerifiedSignIn(c: Context, deps: Deps): Promise<boolean> {
+  const p = deps.config.access?.provider
+  if (!p) return false
+  if (p.type === 'cloudflare-access') return (await cloudflareViewer(c, deps, p)) !== null
+  return (await sessionViewer(c, deps, p.type)) !== null
 }
 
 /** Cheap check before doing any crypto: does the request carry sign-in credentials at all? */
@@ -411,12 +644,20 @@ export function mountAuthRoutes(app: Hono, deps: Deps) {
     const p = deps.config.access?.provider
     return p?.type === 'oidc' ? oidcHandlers(deps, p).callback(c) : notFound(c)
   })
-  app.get('/auth/logout', (c) => {
+  // Signing out changes state, so it is a same-site POST; a cross-site link or image cannot sign
+  // an administrator out. GET keeps old links working by showing a confirmation button.
+  app.get('/auth/logout', async (c) => {
+    if (!deps.config.access?.provider) return notFound(c)
+    const viewer = await currentViewer(c, deps)
+    const chrome = await buildChrome(deps, { viewer, current: '/', signIn: false })
+    return c.html(signOutPage(chrome), 200, { 'cache-control': 'no-store' })
+  })
+  app.post('/auth/logout', (c) => {
     const p = deps.config.access?.provider
     if (!p) return notFound(c)
+    if (!fromThisSite(c, deps)) return c.text('Forbidden', 403)
     deleteCookie(c, SESSION_COOKIE, { path: '/' })
-    if (p.type === 'cloudflare-access') return c.redirect(`https://${p.teamDomain}/cdn-cgi/access/logout`, 302)
-    const res = c.redirect('/', 302)
+    const res = c.redirect(p.type === 'cloudflare-access' ? `https://${p.teamDomain}/cdn-cgi/access/logout` : '/', 303)
     res.headers.set('cache-control', 'no-store')
     return res
   })

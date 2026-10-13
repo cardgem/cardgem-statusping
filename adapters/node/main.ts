@@ -11,9 +11,10 @@ import { createDeps } from '../../src/deps.ts'
 import type { StatusPingConfig } from '../../src/config.ts'
 import { lookupNodeCertificateExpiry } from './expiry.ts'
 import { nodeTcpConnect } from './tcp.ts'
+import { nodeResolveHost } from './dns.ts'
 import { nodeSmtpConnect } from './smtp.ts'
 import { startNodeServer } from './server.ts'
-import { normalizeClientIp } from '../../src/rate-limit.ts'
+import { forwardedClientIp } from './client-ip.ts'
 import { nodeConfirmationProbe, nodeConfirmationSettings } from './confirmation.ts'
 
 /**
@@ -26,7 +27,8 @@ async function legacyConfig(): Promise<StatusPingConfig | undefined> {
   return ((await import(`../../statusping${suffix}.ts`)) as { default?: StatusPingConfig }).default
 }
 
-const env = (name: string) => process.env[name] || undefined
+// Own variables only: process.env inherits Object.prototype, so "toString" would be a function.
+const env = (name: string) => (Object.hasOwn(process.env, name) && process.env[name]) || undefined
 const confirmation = nodeConfirmationSettings(env)
 
 const deps = createDeps({
@@ -37,14 +39,17 @@ const deps = createDeps({
   legacyConfig,
   certificateExpiry: lookupNodeCertificateExpiry,
   tcpConnect: nodeTcpConnect,
+  resolveHost: nodeResolveHost,
   smtpConnect: nodeSmtpConnect,
   confirmationProbe: confirmation ? nodeConfirmationProbe(confirmation) : undefined,
   location: env('STATUSPING_LOCATION'),
-  // A direct Node listener cannot authenticate a forwarding header. Opt in only
-  // when a trusted reverse proxy strips client supplied X-Forwarded-For.
+  // A direct Node listener cannot authenticate a forwarding header. Opt in only when a
+  // trusted reverse proxy is the sole way in; its own (last) X-Forwarded-For entry is used.
   clientIp: env('STATUSPING_TRUST_PROXY') === 'true'
-    ? (request) => normalizeClientIp(request.headers.get('x-forwarded-for')?.split(',')[0] ?? null)
+    ? (request) => forwardedClientIp(request.headers.get('x-forwarded-for'))
     : undefined,
+  // Likewise the Host header: rescue mode may fall back to the request origin as the site address.
+  trustRequestOrigin: env('STATUSPING_TRUST_PROXY') === 'true',
 })
 
 const server = await startNodeServer(deps, { port: Number(env('PORT') ?? 8000) })

@@ -4,6 +4,9 @@
  */
 import type { SinkInput, StatusPingConfig } from '../config.ts'
 import type { Db } from '../db/types.ts'
+import type { Logger } from '../deps.ts'
+import { ACK_KEY_NAME } from '../acknowledgements.ts'
+import { rotateEpochStatement } from '../auth/epoch.ts'
 import { randomToken, timingSafeEqual } from '../util/crypto.ts'
 
 export type SetupStatus = 'pending' | 'complete'
@@ -50,12 +53,20 @@ export interface SetupState {
   failedAttempts: number
 }
 
-/** After this many wrong codes a generated code is replaced. */
-export const MAX_FAILED_CLAIMS = 10
+/** Every this many wrong codes in a row, a warning is logged (the code itself is never rotated). */
+export const FAILED_CLAIM_WARNING_EVERY = 100
 
-/** Human-friendly, unambiguous setup code: XXXX-XXXX-XXXX. */
+/** Alphabet of generated setup codes: 32 unambiguous characters, so 5 bits each. */
+export const SETUP_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+
+/**
+ * Human-friendly, unambiguous setup code: XXXX-XXXX-XXXX. 12 characters from a 32-character
+ * alphabet is 60 bits; 256 is a multiple of 32, so `byte % 32` is uniform. With the claim limit
+ * (5 a minute per address, 10 a minute shared when addresses are unknown) guessing is infeasible,
+ * so wrong guesses never replace the code the owner read from the logs.
+ */
 export function generateSetupCode(): string {
-  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+  const alphabet = SETUP_CODE_ALPHABET
   const bytes = crypto.getRandomValues(new Uint8Array(12))
   const chars = [...bytes].map((byte) => alphabet[byte % alphabet.length]!)
   return [chars.slice(0, 4), chars.slice(4, 8), chars.slice(8, 12)].map((part) => part.join('')).join('-')
@@ -90,21 +101,26 @@ export function setupCodeMatches(input: string, expected: string): boolean {
   return timingSafeEqual(normalizeCode(input), normalizeCode(expected))
 }
 
-/** Counts a wrong code; a generated code is replaced after MAX_FAILED_CLAIMS failures. */
-export async function recordFailedClaim(db: Db, state: SetupState, usesEnvToken: boolean, now: number): Promise<boolean> {
+/**
+ * Counts a wrong code. The code is never replaced on failures: that would let anyone invalidate
+ * the code the owner reads from the logs. The rate limit makes guessing infeasible; a long run
+ * of failures is logged so the owner can see it.
+ */
+export async function recordFailedClaim(deps: { db: Db; log: Logger }, state: SetupState, now: number): Promise<number> {
   const failures = state.failedAttempts + 1
-  const regenerate = !usesEnvToken && failures >= MAX_FAILED_CLAIMS
-  await db.run(
-    `UPDATE setup_state SET failed_attempts = ?, code = ?, updated_at = ? WHERE id = 1`,
-    [regenerate ? 0 : failures, regenerate ? generateSetupCode() : state.code, now],
-  )
-  return regenerate
+  await deps.db.run(`UPDATE setup_state SET failed_attempts = failed_attempts + 1, updated_at = ? WHERE id = 1`, [now])
+  if (failures % FAILED_CLAIM_WARNING_EVERY === 0) deps.log('warn', `${failures} wrong setup codes have been entered since the last successful claim. The code is unchanged; requests are rate limited.`)
+  return failures
 }
 
 /**
  * Puts the instance into setup mode. The current DB configuration is kept in
- * previous_config_json; built-in accounts, the session key, stored sign-in settings, and CSRF
- * tokens are removed so every existing session ends. Monitor history is kept.
+ * previous_config_json; built-in accounts, the session and acknowledgement keys, stored settings and credential
+ * bindings, an unfinished sign-in method change, CSRF tokens and MCP access tokens are removed, and
+ * the secret epoch is replaced, so every existing session, recovery session, alert link and API
+ * token ends (with SESSION_SECRET, STATUSPING_RECOVERY_TOKEN or ACK_SECRET set too: see
+ * auth/epoch.ts). Ping URLs created in the app are revoked. Monitor history and email subscribers
+ * are kept.
  */
 export async function beginSetup(db: Db, actor: string, now: number): Promise<void> {
   await db.batch([
@@ -119,8 +135,21 @@ export async function beginSetup(db: Db, actor: string, now: number): Promise<vo
     },
     { sql: `DELETE FROM admin_config WHERE id = 1` },
     { sql: `DELETE FROM local_users` },
-    { sql: `DELETE FROM instance_secrets WHERE name = 'session_key' OR name LIKE 'env:%'` },
+    // Stored settings, the destinations channel credentials were bound to, and any unfinished
+    // sign-in method change (its draft and the values entered for it).
+    // The generated acknowledgement key goes too, so alert links sent before the reset stop working.
+    { sql: `DELETE FROM instance_secrets WHERE name IN ('session_key', 'access_switch', ?) OR substr(name, 1, 4) = 'env:' OR substr(name, 1, 5) = 'bind:' OR substr(name, 1, 8) = 'pending:'`, params: [ACK_KEY_NAME] },
     { sql: `DELETE FROM admin_csrf` },
+    // MCP tokens act as the administrators who created them; none of them belongs to the next owner.
+    { sql: `DELETE FROM api_tokens` },
+    // Ping URLs created in the app belong to the old owner too: a monitor id the next
+    // configuration reuses must not keep accepting them (syncConfig keeps a stored hash).
+    { sql: `UPDATE monitors SET ping_token_hash = NULL WHERE ping_token_hash IS NOT NULL` },
+    // The sign-in epoch (sign_in_epoch) is deliberately left as it is: sessions and recovery
+    // sessions derive their key from both epochs (auth/epoch.ts epochKey), so replacing the secret
+    // epoch alone already changes every sign-in key and ends every sign-in made before the reset.
+    // The stored session key, the other sign-in key, is deleted above.
+    rotateEpochStatement(now),
     { sql: `INSERT INTO audit_log (actor, action, target, before_json, after_json, at) VALUES (?, 'instance.reset', 'setup', NULL, NULL, ?)`, params: [actor, now] },
   ])
 }

@@ -5,34 +5,40 @@
  * that binds the browser to a short-lived signed cookie carrying a CSRF value that every later
  * form must echo. Finishing writes the whole configuration in one DB batch.
  */
+import { OIDC_MAX_RESPONSE_BYTES, readCappedJson } from '../util/capped-body.ts'
 import type { Context, Hono } from 'hono'
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie'
-import { hashUserPassword, sameOrigin, setSession } from '../auth/providers.ts'
+import { basicAuthEnvIgnoredNote, basicAuthUsersLists, hashUserPassword, fromThisSite, setSession } from '../auth/providers.ts'
 import { sign, unsign } from '../auth/session.ts'
 import type { AdminConfig } from '../admin/security.ts'
 import { validateAdminConfig } from '../admin/security.ts'
+import { ACK_KEY_NAME } from '../acknowledgements.ts'
+import { rotateEpochStatement } from '../auth/epoch.ts'
 import { locateProblems, parseAdminYaml, stringifyAdminYaml } from '../admin/yaml.ts'
-import { FormError, monitorRows, pageList, SINK_FIELDS, sinkEnvName, sinkFromForm, type SinkType } from '../admin/forms.ts'
+import { FormError, monitorRows, pageList, SINK_FIELDS, sinkFromForm, type SinkType } from '../admin/forms.ts'
 import { revisionStatements, sendSinkTest } from '../admin/service.ts'
+import { forgetChannelStatements } from '../admin/channel-credentials.ts'
 import type { Statement } from '../db/types.ts'
 import { SINK_TYPES } from '../config.ts'
-import { b64urlEncode, verifyJwt } from '../auth/jwt.ts'
+import { b64urlEncode, emailVerified, verifyJwt } from '../auth/jwt.ts'
 import { discover } from '../auth/providers.ts'
 import type { AuthProviderInput, MonitorInput, StatusPingConfig } from '../config.ts'
 import { type Deps, isStorableEnv, refreshAdminConfig, STORABLE_ENV, storedEnvKey } from '../deps.ts'
 import { rotatePingToken } from '../admin/service.ts'
-import { syncConfig } from '../sync.ts'
+import { hasPingToken, syncConfig } from '../sync.ts'
 import { TEAM_DOMAIN, presetById } from './instructions.ts'
 import { accessPage, channelPage, type ChannelSources, type EnvSource, importPage, type MonitorValues, oidcPage, setupDonePage } from './ui.ts'
-import { consumePingRateLimit } from '../rate-limit.ts'
+import { consumeAttempt } from '../rate-limit.ts'
 import { randomToken, timingSafeEqual } from '../util/crypto.ts'
 import { discover as discoverIssuer } from '../auth/providers.ts'
 import { isValidTimeZone, nowSeconds } from '../util/time.ts'
+import { own } from '../util/own.ts'
 import {
   beginSetup, expectedSetupCode, loadSetupState, recordFailedClaim, saveDraft, setupCodeMatches,
   type SetupDraft, type SetupMethod, type SetupMonitor, type SetupState,
 } from './state.ts'
 import { accountPage, basicsPage, claimPage, methodPage, monitorPage, resetPage, reviewPage, type SetupStep } from './ui.ts'
+import { targetFetch } from '../util/private-targets.ts'
 
 const SETUP_COOKIE = 'sp_setup'
 /** Short-lived state for the setup OIDC test sign-in (state, nonce, PKCE verifier). */
@@ -55,6 +61,8 @@ const VERIFY_ERRORS: Record<string, string> = {
 }
 const SETUP_SESSION_SECONDS = 2 * 60 * 60
 const ATTEMPTS_PER_MINUTE = 5
+/** The shared bucket for clients whose address is unknown. */
+const ATTEMPTS_PER_MINUTE_UNKNOWN_CLIENT = 10
 const EMAIL = /^[^@\s]+@[^@\s]+\.[^@\s]+$/
 const headers = { 'cache-control': 'no-store', 'x-robots-tag': 'noindex' }
 
@@ -79,7 +87,8 @@ async function readSetupSession(c: Context, state: SetupState): Promise<{ exp: n
     .filter((part) => part.startsWith(`${SETUP_COOKIE}=`)).map((part) => decodeURIComponent(part.slice(SETUP_COOKIE.length + 1)))
   for (const value of values) {
     const s = await unsign<{ exp: number; csrf: string }>(value, state.sessionKey, nowSeconds())
-    if (s) return s
+    // Only a setup session has a CSRF token; other values signed with this key (sign-in cookies) do not.
+    if (s && typeof s.csrf === 'string' && s.csrf) return s
   }
   return null
 }
@@ -116,7 +125,7 @@ export function draftSummary(draft: SetupDraft): Array<[string, string]> {
       : m.kind === 'tcp' ? `${m.name}: port ${m.port} on ${m.host}, checked every minute`
         : `${m.name}: ${m.url}, checked every minute${m.keyword ? ` for "${m.keyword}"` : ''}`
   const imported = draft.imported
-  const channel = draft.channel ? `${SINK_FIELDS[draft.channel.sink.type as SinkType]?.label ?? draft.channel.sink.type} (${draft.channel.name})` : 'None yet'
+  const channel = draft.channel ? `${own(SINK_FIELDS, draft.channel.sink.type)?.label ?? draft.channel.sink.type} (${draft.channel.name})` : 'None yet'
   return [
     ...(imported ? [['Imported configuration', importSummary(imported)] as [string, string]] : []),
     ['Site title', draft.title ?? ''],
@@ -177,10 +186,15 @@ export function draftConfig(draft: SetupDraft): AdminConfig {
 
 /**
  * Ends setup in one batch: configuration (as the first revision of this setup), account, session
- * key, audit, and the end of setup mode. The status guard makes a repeated finish a no-op.
+ * key, audit, and the end of setup mode. The status guard makes a repeated finish a no-op that
+ * returns false.
  */
-export async function completeSetup(deps: Deps, config: AdminConfig, who: { email: string; method: SetupMethod; passwordHash?: string; actor?: string }, now: number): Promise<void> {
+export async function completeSetup(deps: Deps, config: AdminConfig, who: { email: string; method: SetupMethod; passwordHash?: string; actor?: string }, now: number): Promise<boolean> {
   const statements: Statement[] = [
+    // The atomic guard: unless setup is still pending when this transaction runs, this sets a NOT
+    // NULL column to NULL, so the whole batch fails and writes nothing. A second finish that read
+    // "pending" before the first one committed (a double submit) therefore cannot write twice.
+    { sql: `UPDATE setup_state SET updated_at = CASE WHEN status = 'pending' THEN updated_at ELSE NULL END WHERE id = 1` },
     ...revisionStatements(config, who.email, now, { action: 'setup.complete' }),
     { sql: `INSERT INTO admin_config (id, config_json, updated_at, updated_by) VALUES (1, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET config_json = excluded.config_json, updated_at = excluded.updated_at, updated_by = excluded.updated_by`,
@@ -191,15 +205,30 @@ export async function completeSetup(deps: Deps, config: AdminConfig, who: { emai
       : []),
     { sql: `INSERT INTO instance_secrets (name, value, created_at) VALUES ('session_key', ?, ?)
             ON CONFLICT(name) DO UPDATE SET value = excluded.value, created_at = excluded.created_at`, params: [randomToken(48), now] },
+    // Like the session key, the generated acknowledgement key starts fresh with the new owner; the
+    // next escalation alert creates a new one (see acknowledgeSecret).
+    { sql: `DELETE FROM instance_secrets WHERE name = ?`, params: [ACK_KEY_NAME] },
+    // Nothing signed or issued during setup carries over: no MCP token (none can be created while
+    // setup is pending, but a database restored mid-setup could hold some), and a new secret epoch,
+    // so keys derived from SESSION_SECRET, STATUSPING_RECOVERY_TOKEN and ACK_SECRET change too.
+    { sql: `DELETE FROM api_tokens` },
+    rotateEpochStatement(now),
     { sql: `INSERT INTO audit_log (actor, action, target, before_json, after_json, at) VALUES (?, 'setup.complete', 'setup', NULL, ?, ?)`,
       params: [who.actor ?? who.email, JSON.stringify({ method: who.method }), now] },
     { sql: `UPDATE setup_state SET status = 'complete', code = NULL, session_key = NULL, draft_json = '{}', failed_attempts = 0, updated_at = ? WHERE id = 1 AND status = 'pending'`, params: [now] },
   ]
-  // Only the first finish writes: a second one (double submit) finds setup already complete.
-  const pending = await deps.db.first<{ status: string }>(`SELECT status FROM setup_state WHERE id = 1`)
-  if (pending?.status !== 'pending') return
-  await deps.db.batch(statements)
+  // Only the first finish writes: a second one (double submit) finds setup already complete, or,
+  // if it raced past this check, is stopped by the guard statement inside the transaction.
+  const status = async () => (await deps.db.first<{ status: string }>(`SELECT status FROM setup_state WHERE id = 1`))?.status
+  if (await status() !== 'pending') return false
+  try {
+    await deps.db.batch(statements)
+  } catch (error) {
+    if (await status() !== 'pending') return false
+    throw error
+  }
   await refreshAdminConfig(deps, now)
+  return true
 }
 
 function currentStep(draft: SetupDraft): SetupStep {
@@ -221,9 +250,17 @@ export function mountSetupRoutes(app: Hono, deps: Deps): void {
   const notFound = (c: Context) => c.text('Not found', 404, headers)
   const html = (c: Context, body: string, status: 200 | 400 | 401 | 403 | 429 = 200) => c.html(body, status, headers)
 
+  /**
+   * A password set during setup is stored in the site and takes precedence over a BASIC_AUTH_USERS
+   * entry for the same address, which is then ignored; say so, so the stale entry gets removed.
+   */
+  const envListsAddress = (email: string) => basicAuthUsersLists((name) => (deps.hasRealEnv(name) ? deps.getEnv(name) : undefined), email)
+  const envPasswordWarning = (draft: { method?: SetupMethod; email?: string; passwordHash?: string }) =>
+    (draft.method ?? 'basic') === 'basic' && draft.passwordHash && draft.email && envListsAddress(draft.email) ? basicAuthEnvIgnoredNote(draft.email) : undefined
+
   const sessionSecretSet = () => (deps.getEnv('SESSION_SECRET')?.length ?? 0) >= 32
   /** Where a setting is set: a Worker secret wins over a value saved here. Never the value. */
-  const source = (name: string): EnvSource => (deps.hasRealEnv(name) ? 'env' : deps.storedEnv[name] ? 'db' : false)
+  const source = (name: string): EnvSource => (deps.hasRealEnv(name) ? 'env' : own(deps.storedEnv, name) ? 'db' : false)
   const oidcEnv = () => ({ OIDC_CLIENT_ID: source('OIDC_CLIENT_ID'), OIDC_CLIENT_SECRET: source('OIDC_CLIENT_SECRET') })
 
   /** Where the saved channel's credentials are set. Names only, never values. */
@@ -233,19 +270,16 @@ export function mountSetupRoutes(app: Hono, deps: Deps): void {
     const refs: Record<string, unknown> = { ...s, ...(s.via && typeof s.via === 'object' ? s.via as Record<string, unknown> : {}) }
     for (const [key, value] of Object.entries(refs)) {
       const name = value && typeof value === 'object' && typeof (value as { $env?: unknown }).$env === 'string' ? (value as { $env: string }).$env : undefined
-      if (name) out[key] = { envName: name, source: deps.hasRealEnv(name) ? 'env' : isStorableEnv(name) && deps.storedEnv[name] ? 'db' : false }
+      if (name) out[key] = { envName: name, source: deps.hasRealEnv(name) ? 'env' : isStorableEnv(name) && own(deps.storedEnv, name) ? 'db' : false }
     }
     return out
   }
-  /** Erases the credentials a wizard channel stored (exact prefix; LIKE would treat _ as a wildcard). */
-  const forgetChannel = (name: string) => {
-    const prefix = storedEnvKey(sinkEnvName(name, ''))
-    return deps.db.run(`DELETE FROM instance_secrets WHERE substr(name, 1, ?) = ?`, [prefix.length, prefix])
-  }
+  /** Erases the credentials a wizard channel stored, by exact name (never a prefix). */
+  const forgetChannel = (name: string) => deps.db.batch(forgetChannelStatements(name))
 
   const limited = async (c: Context, bucket: string) => {
-    const ip = deps.clientIp(c.req.raw)
-    return ip !== null && !(await consumePingRateLimit(deps.db, `${bucket}:${ip}`, nowSeconds(), ATTEMPTS_PER_MINUTE))
+    // Without a client address (Node without STATUSPING_TRUST_PROXY) every client shares one bucket.
+    return !(await consumeAttempt(deps.db, bucket, deps.clientIp(c.req.raw), nowSeconds(), ATTEMPTS_PER_MINUTE, ATTEMPTS_PER_MINUTE_UNKNOWN_CLIENT))
   }
 
   /** The setup session for this browser, or null. */
@@ -265,7 +299,7 @@ export function mountSetupRoutes(app: Hono, deps: Deps): void {
     if ('response' in loaded) return { response: loaded.response }
     if (!loaded.session) return { response: c.redirect('/setup', 303) }
     const form = (await c.req.parseBody().catch(() => ({}))) as Form
-    if (!sameOrigin(c, deps) || !timingSafeEqual(field(form, 'csrf'), loaded.session.csrf)) return { response: c.text('Forbidden', 403, headers) }
+    if (!fromThisSite(c, deps) || !timingSafeEqual(field(form, 'csrf'), loaded.session.csrf)) return { response: c.text('Forbidden', 403, headers) }
     return { state: loaded.state, csrf: loaded.session.csrf, form }
   }
 
@@ -303,7 +337,7 @@ export function mountSetupRoutes(app: Hono, deps: Deps): void {
         const type = (SINK_TYPES as readonly string[]).includes(c.req.query('type') ?? '') ? c.req.query('type') as SinkType : (saved?.sink.type ?? 'slack')
         return html(c, channelPage({ csrf, completed, type, saved, sources: channelSources(saved?.sink), tested: c.req.query('tested') === '1', error }))
       }
-      default: return html(c, reviewPage({ csrf, completed, summary: draftSummary(draft), yaml: stringifyAdminYaml(draftConfig(draft)), back: draft.imported ? '/setup?step=import' : undefined }))
+      default: return html(c, reviewPage({ csrf, completed, summary: draftSummary(draft), yaml: stringifyAdminYaml(draftConfig(draft)), back: draft.imported ? '/setup?step=import' : undefined, warning: envPasswordWarning(draft) }))
     }
   }
 
@@ -318,7 +352,7 @@ export function mountSetupRoutes(app: Hono, deps: Deps): void {
       res.headers.set('cache-control', 'no-store')
       return res
     }
-    return render(c, loaded.state, loaded.session.csrf, requested, VERIFY_ERRORS[c.req.query('error') ?? ''])
+    return render(c, loaded.state, loaded.session.csrf, requested, own(VERIFY_ERRORS, c.req.query('error') ?? ''))
   })
 
   // ── Cloudflare Access and OIDC: connect & verify ────────────────────────────────────────────
@@ -349,7 +383,7 @@ export function mountSetupRoutes(app: Hono, deps: Deps): void {
       if (new URL(issuer).protocol !== 'https:') error = 'The issuer must be an https:// URL.'
     } catch { error = 'Enter the issuer URL, such as https://accounts.google.com.' }
     if (!error) {
-      try { await discover(issuer, deps.fetch) } catch (e) {
+      try { await discover(issuer, deps) } catch (e) {
         error = `StatusPing could not read ${issuer}/.well-known/openid-configuration (${(e as Error).message}). Check the issuer URL.`
       }
     }
@@ -367,7 +401,7 @@ export function mountSetupRoutes(app: Hono, deps: Deps): void {
     const clientId = deps.getEnv('OIDC_CLIENT_ID')
     if (draft.method !== 'oidc' || !draft.issuer || !clientId || !deps.getEnv('OIDC_CLIENT_SECRET')) return c.redirect('/setup?step=account', 303)
     let endpoint: string
-    try { endpoint = (await discover(draft.issuer, deps.fetch)).authorization_endpoint } catch { return c.redirect('/setup?step=account&error=oidc-discovery', 303) }
+    try { endpoint = (await discover(draft.issuer, deps)).authorization_endpoint } catch { return c.redirect('/setup?step=account&error=oidc-discovery', 303) }
     const [state, nonce, verifier] = [randomToken(32), randomToken(32), randomToken(64)]
     const challenge = b64urlEncode(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier))))
     setCookie(c, SETUP_LOGIN_COOKIE, await sign({ state, nonce, verifier, exp: nowSeconds() + 600 }, loaded.state.sessionKey), {
@@ -423,13 +457,13 @@ export function mountSetupRoutes(app: Hono, deps: Deps): void {
     const loaded = await pending(c)
     if ('response' in loaded) return loaded.response
     const usesEnvToken = Boolean(deps.getEnv('STATUSPING_SETUP_TOKEN'))
-    if (!sameOrigin(c, deps)) return c.text('Forbidden', 403, headers)
+    if (!fromThisSite(c, deps)) return c.text('Forbidden', 403, headers)
     if (await limited(c, 'setup')) return html(c, claimPage({ usesEnvToken, error: 'Too many attempts. Wait a minute and try again.' }), 429)
     const form = (await c.req.parseBody().catch(() => ({}))) as Form
     const expected = expectedSetupCode(loaded.state, deps.getEnv)
     if (!expected || !loaded.state.sessionKey || !setupCodeMatches(field(form, 'code'), expected)) {
-      const regenerated = await recordFailedClaim(deps.db, loaded.state, usesEnvToken, nowSeconds())
-      return html(c, claimPage({ usesEnvToken, error: 'That setup code is not correct.', note: regenerated ? 'After repeated failures a new code was generated. Check the logs again.' : undefined }), 401)
+      await recordFailedClaim(deps, loaded.state, nowSeconds())
+      return html(c, claimPage({ usesEnvToken, error: 'That setup code is not correct.' }), 401)
     }
     await deps.db.run(`UPDATE setup_state SET failed_attempts = 0 WHERE id = 1`)
     // Older versions scoped this cookie to /setup; a stale copy there would shadow the new one.
@@ -553,9 +587,12 @@ export function mountSetupRoutes(app: Hono, deps: Deps): void {
     const values = Object.fromEntries(Object.entries(r.form).filter(([key, value]) => key !== 'csrf' && typeof value === 'string' && !SINK_FIELDS[type].fields.some((f) => f.secret && f.key === key) && key !== 'password' && key !== 'apiKey')) as Record<string, string>
     let error: string
     try {
-      const { sink, secrets } = sinkFromForm(r.form, name, existing)
+      const { sink, secrets: entered } = sinkFromForm(r.form, name, existing)
+      // A value for a name that is also a real Worker secret is not stored: the real one wins,
+      // and a stale stored copy would take over if the Worker secret were later deleted.
+      const secrets = entered.filter((secret) => !deps.hasRealEnv(secret.name))
       const pending = Object.fromEntries(secrets.map((secret) => [secret.name, secret.value]))
-      try { validateAdminConfig(draftConfig({ ...draft, channel: { name, sink } }), (env) => pending[env] ?? deps.getEnv(env)) } catch (e) { throw new FormError((e as Error).message) }
+      try { validateAdminConfig(draftConfig({ ...draft, channel: { name, sink } }), (env) => own(pending, env) ?? deps.getEnv(env)) } catch (e) { throw new FormError((e as Error).message) }
       const now = nowSeconds()
       if (previous && previous.name !== name) await forgetChannel(previous.name)
       await deps.db.batch([
@@ -601,7 +638,7 @@ export function mountSetupRoutes(app: Hono, deps: Deps): void {
     if ('response' in loaded) return loaded.response
     if (!loaded.session) return c.redirect('/setup', 303)
     const form = (await c.req.parseBody().catch(() => ({}))) as Form
-    if (!sameOrigin(c, deps) || !timingSafeEqual(field(form, 'csrf'), loaded.session.csrf)) return c.text('Forbidden', 403, headers)
+    if (!fromThisSite(c, deps) || !timingSafeEqual(field(form, 'csrf'), loaded.session.csrf)) return c.text('Forbidden', 403, headers)
     const draft = loaded.state.draft
     if (!draft.title) return c.redirect('/setup', 303)
     const completed = new Set<SetupStep>(['claim', 'method', 'account', 'basics'])
@@ -641,12 +678,14 @@ export function mountSetupRoutes(app: Hono, deps: Deps): void {
     try {
       config = validateAdminConfig(draftConfig(draft), deps.getEnv).config
     } catch (error) {
-      return html(c, reviewPage({ csrf: r.csrf, completed: new Set(['claim', 'method', 'account', 'basics', 'monitor']), summary: draftSummary(draft), yaml: stringifyAdminYaml(draftConfig(draft)), error: (error as Error).message }), 400)
+      return html(c, reviewPage({ csrf: r.csrf, completed: new Set(['claim', 'method', 'account', 'basics', 'monitor']), summary: draftSummary(draft), yaml: stringifyAdminYaml(draftConfig(draft)), error: (error as Error).message, warning: envPasswordWarning(draft) }), 400)
     }
     const email = draft.email!
     const method = draft.method ?? 'basic'
-    await completeSetup(deps, config, { email, method, passwordHash: draft.passwordHash }, now)
+    const finished = await completeSetup(deps, config, { email, method, passwordHash: draft.passwordHash }, now)
     deleteCookie(c, SETUP_COOKIE, { path: '/' })
+    // A second submit of the same finish: the first one already signed this browser in.
+    if (!finished) return c.redirect('/admin', 303)
     // Cloudflare Access signs people in on every request; the other methods use a session.
     if (method !== 'cloudflare-access') await setSession(c, deps, { email, groups: [], provider: method === 'oidc' ? 'oidc' : 'basic' })
     // A scheduled job needs its ping URL, which exists only once: generate it and show it now.
@@ -656,7 +695,7 @@ export function mountSetupRoutes(app: Hono, deps: Deps): void {
       if (token) return html(c, setupDonePage({ pingUrl: `${config.baseUrl.replace(/\/+$/, '')}/ping/${token}`, monitorName: draft.monitor.name }))
     }
     // Imported scheduled jobs get their ping URLs in Settings, where each is shown once.
-    if (draft.imported && monitorRows(config).some((row) => row.monitor.kind === 'push' && !deps.pingTokens[row.monitor.id])) {
+    if (draft.imported && monitorRows(config).some((row) => row.monitor.kind === 'push' && !hasPingToken(deps.pingTokens, row.monitor.id))) {
       await syncConfig(deps, now)
       return c.redirect('/admin/monitors?notice=setup-ping-urls', 303)
     }
@@ -673,10 +712,9 @@ export function mountSetupRoutes(app: Hono, deps: Deps): void {
     if (await limited(c, 'setup')) return json({ error: 'Too many attempts. Wait a minute and try again.' }, 429)
     let body: Record<string, unknown>
     try { body = await c.req.json() } catch { return json({ error: 'Send a JSON body: { "code", "admin", "yaml" }.' }, 400) }
-    const usesEnvToken = Boolean(deps.getEnv('STATUSPING_SETUP_TOKEN'))
     const expected = expectedSetupCode(state, deps.getEnv)
     if (!expected || typeof body.code !== 'string' || !setupCodeMatches(body.code, expected)) {
-      await recordFailedClaim(deps.db, state, usesEnvToken, nowSeconds())
+      await recordFailedClaim(deps, state, nowSeconds())
       return json({ error: 'That setup code is not correct.' }, 401)
     }
     const email = typeof body.admin === 'string' ? body.admin.trim().toLowerCase() : ''
@@ -691,7 +729,7 @@ export function mountSetupRoutes(app: Hono, deps: Deps): void {
     if (provider.type === 'cloudflare-access' && !deps.getEnv('CF_ACCESS_AUD')) return json({ error: 'CF_ACCESS_AUD is not set. Add it as a secret first.' }, 400)
     if (provider.type === 'oidc') {
       if (!deps.getEnv('OIDC_CLIENT_ID') || !deps.getEnv('OIDC_CLIENT_SECRET')) return json({ error: 'OIDC_CLIENT_ID and OIDC_CLIENT_SECRET must be set as secrets first.' }, 400)
-      try { await discoverIssuer(provider.issuer, deps.fetch) } catch (e) { return json({ error: `StatusPing could not read ${provider.issuer}/.well-known/openid-configuration (${(e as Error).message}).` }, 400) }
+      try { await discoverIssuer(provider.issuer, deps) } catch (e) { return json({ error: `StatusPing could not read ${provider.issuer}/.well-known/openid-configuration (${(e as Error).message}).` }, 400) }
     }
     const admins = input.access?.admins
     const next = { ...input, admin: true, access: { ...(input.access ?? {}), provider, admins: { ...(admins ?? {}), emails: [...new Set([email, ...(admins?.emails ?? [])])] } } } as AdminConfig
@@ -700,9 +738,16 @@ export function mountSetupRoutes(app: Hono, deps: Deps): void {
     const method = provider.type as SetupMethod
     const password = method === 'basic' ? randomToken(24) : undefined
     const now = nowSeconds()
-    await completeSetup(deps, config, { email, method, passwordHash: password ? await hashUserPassword(password) : undefined, actor: `${email} (api)` }, now)
+    if (!await completeSetup(deps, config, { email, method, passwordHash: password ? await hashUserPassword(password) : undefined, actor: `${email} (api)` }, now)) {
+      return json({ error: 'Setup is already complete.' }, 404)
+    }
     const origin = new URL(c.req.url).origin
-    return json({ ok: true, admin: email, method, ...(password ? { password, note: 'Shown once. Sign in with it, then store it in a password manager.' } : {}), signIn: `${origin}/admin` }, 201)
+    // Scheduled jobs have no ping URL until one is created in Settings (each is shown once there).
+    await syncConfig(deps, now)
+    const pingUrlsNeeded = (await deps.db.all<{ id: string }>(`SELECT id FROM monitors WHERE kind = 'push' AND paused = 0 AND ping_token_hash IS NULL ORDER BY id`)).map((r) => r.id)
+    return json({ ok: true, admin: email, method, ...(password ? { password, note: 'Shown once. Sign in with it, then store it in a password manager.' } : {}), signIn: `${origin}/admin`,
+      ...(password && envListsAddress(email) ? { warning: basicAuthEnvIgnoredNote(email) } : {}),
+      ...(pingUrlsNeeded.length ? { pingUrlsNeeded, pingUrlsNote: `These scheduled jobs have no ping URL yet. Create each one in Settings: ${origin}/admin/monitors` } : {}) }, 201)
   })
 
   // ── Reset: only exists while the STATUSPING_RESET_TOKEN secret is set ──────────────────────
@@ -713,7 +758,7 @@ export function mountSetupRoutes(app: Hono, deps: Deps): void {
   app.post('/setup/reset', async (c) => {
     const token = resetToken()
     if (!token) return notFound(c)
-    if (!sameOrigin(c, deps)) return c.text('Forbidden', 403, headers)
+    if (!fromThisSite(c, deps)) return c.text('Forbidden', 403, headers)
     if (await limited(c, 'setup-reset')) return html(c, resetPage({ error: 'Too many attempts. Wait a minute and try again.' }), 429)
     const form = (await c.req.parseBody().catch(() => ({}))) as Form
     if (field(form, 'confirm').toLowerCase() !== 'reset') return html(c, resetPage({ error: 'Type reset to confirm.' }), 400)
@@ -784,8 +829,8 @@ export function mountSetupAuthRoutes(app: Hono, deps: Deps): void {
     const clientId = deps.getEnv('OIDC_CLIENT_ID') ?? ''
     let claims: Record<string, unknown>
     try {
-      const d = await discover(draft.issuer, deps.fetch)
-      const res = await deps.fetch(d.token_endpoint, {
+      const d = await discover(draft.issuer, deps)
+      const res = await targetFetch(deps)(d.token_endpoint, {
         method: 'POST',
         headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
         body: new URLSearchParams({
@@ -794,15 +839,16 @@ export function mountSetupAuthRoutes(app: Hono, deps: Deps): void {
         }),
       })
       if (!res.ok) return back(c, 'oidc-token')
-      const idToken = ((await res.json()) as { id_token?: string }).id_token
+      const idToken = ((await readCappedJson(res, OIDC_MAX_RESPONSE_BYTES)) as { id_token?: string }).id_token
       if (!idToken) return back(c, 'oidc-token')
       try {
-        claims = await verifyJwt(idToken, { jwksUrl: d.jwks_uri, issuer: d.issuer, audience: clientId, fetch: deps.fetch, now: nowSeconds() })
+        claims = await verifyJwt(idToken, { jwksUrl: d.jwks_uri, issuer: d.issuer, audience: clientId, fetch: targetFetch(deps), now: nowSeconds() })
       } catch { return back(c, 'oidc-id-token') }
     } catch { return back(c, 'oidc-discovery') }
     if (claims.nonce !== login.nonce) return back(c, 'oidc-state')
     const email = typeof claims.email === 'string' ? claims.email.toLowerCase() : ''
-    if (!email || (claims.email_verified === false && !draft.trustUnverifiedEmail)) return back(c, 'oidc-email')
+    // A missing email_verified claim counts as unverified unless the provider is trusted.
+    if (!email || (!emailVerified(claims) && !draft.trustUnverifiedEmail)) return back(c, 'oidc-email')
     await saveDraft(deps.db, { ...draft, email, verified: true }, nowSeconds())
     return back(c)
   })

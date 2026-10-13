@@ -178,6 +178,88 @@ describe('three-way upgrade plan', () => {
     expect(overlapping.conflicts[0]).toMatchObject({ path: 'src/app.ts', reason: 'modified-locally' })
     expect(decode(overlapping.conflicts[0]!.markers)).toBe('// header\nexport const a = 1\nexport const b = 2\nexport const c = 3\n<<<<<<< your version\n// our footer\n=======\n// footer v2\n>>>>>>> StatusPing\n')
   })
+
+  it('never deletes a file when the base release could not be verified (B1)', () => {
+    // A tampered old tag adds the customer's own workflow to the base, so it looks unchanged and,
+    // being absent from the target, deletable.
+    const custom = 'on: push\njobs: { deploy: {} }\n'
+    const crafted = release('0.1.0', { '.github/workflows/custom.yml': custom })
+    const current = release('0.1.0', { '.github/workflows/custom.yml': custom })
+    const target = release('0.2.0', { 'src/removed.ts': null })
+    const run = (unverifiedBase?: boolean) => planUpgrade({ base: files(crafted), target: files(target), current: files(current), currentWrangler: encode(wrangler('0.1.0')), unverifiedBase })
+    expect(run().deletes).toEqual(['.github/workflows/custom.yml', 'src/removed.ts'])
+
+    const guarded = run(true)
+    expect(guarded.safe).toBe(true)
+    expect(guarded.deletes).toEqual([])
+    expect(guarded.conflicts).toEqual([
+      { path: '.github/workflows/custom.yml', reason: 'removed-upstream' },
+      { path: 'src/removed.ts', reason: 'removed-upstream' },
+    ])
+    // Everything else is planned as usual.
+    expect(decode(guarded.writes.get('src/app.ts'))).toBe("export const version = '0.2.0'\n")
+  })
+
+  it('does not let an unverified base hide a target file or overwrite a customer edit (finding 2)', () => {
+    // A tampered old tag that already holds the target's security fix makes the file look
+    // unchanged upstream, so it is left out; one that holds the customer's edit makes the edit
+    // look like the release's, so it is replaced without any flag.
+    const fix = "export const version = '0.2.0' // security fix\n"
+    const edited = 'export const unchanged = "our edit"\n'
+    const crafted = release('0.1.0', { 'src/app.ts': fix, 'src/stable.ts': edited })
+    const current = release('0.1.0', { 'src/stable.ts': edited })
+    const target = release('0.2.0', { 'src/app.ts': fix, 'src/stable.ts': 'export const unchanged = "v2"\n' })
+    const run = (unverifiedBase?: boolean) => planUpgrade({ base: files(crafted), target: files(target), current: files(current), currentWrangler: encode(wrangler('0.1.0')), unverifiedBase })
+
+    // Without the guard (a verified base is trusted): both outcomes happen silently.
+    const trusted = run()
+    expect(trusted.writes.has('src/app.ts')).toBe(false)
+    expect(trusted.conflicts.map((c) => c.path)).not.toContain('src/app.ts')
+    expect(decode(trusted.writes.get('src/stable.ts'))).toBe('export const unchanged = "v2"\n')
+    expect(trusted.merged).toEqual([])
+    expect(trusted.rewritten).toEqual([])
+    expect(trusted.notWritten).toEqual([])
+
+    const guarded = run(true)
+    expect(guarded.safe).toBe(true)
+    // The left-out fix is reported, not skipped.
+    expect(guarded.writes.has('src/app.ts')).toBe(false)
+    expect(guarded.conflicts).toContainEqual({ path: 'src/app.ts', reason: 'modified-locally' })
+    expect(guarded.notWritten).toEqual([{ path: 'src/app.ts', reason: 'modified-locally' }])
+    // The overwrite still happens (the file matches the base) but is listed for review.
+    expect(decode(guarded.writes.get('src/stable.ts'))).toBe('export const unchanged = "v2"\n')
+    expect(guarded.rewritten).toContain('src/stable.ts')
+    expect(guarded.rewritten).toEqual([...guarded.writes.keys()].filter((p) => p !== 'wrangler.toml').sort())
+  })
+
+  it('with an unverified base, conflicts instead of merging and keeps up-to-date files and local notes', () => {
+    const base = release('0.1.0', { 'src/app.ts': "// header\nexport const version = '0.1.0'\n" })
+    const current = release('0.1.0', {
+      'src/app.ts': "// our header\nexport const version = '0.1.0'\n",
+      'src/added.ts': 'export const added = true\n',
+      'README.md': readme('Release 0.1.0', 'Our notes.'),
+    })
+    const target = release('0.2.0', { 'src/app.ts': "// header\nexport const version = '0.2.0'\n", 'src/added.ts': 'export const added = true\n' })
+    const guarded = planUpgrade({ base: files(base), target: files(target), current: files(current), currentWrangler: encode(wrangler('0.1.0')), unverifiedBase: true })
+    expect(guarded.safe).toBe(true)
+    // A verified base would merge these line by line; an unverified one may not.
+    expect(guarded.merged).toEqual([])
+    expect(guarded.conflicts).toContainEqual({ path: 'src/app.ts', reason: 'modified-locally' })
+    expect(guarded.notWritten).toEqual([{ path: 'src/app.ts', reason: 'modified-locally' }])
+    // Already identical to the target: neither written nor reported.
+    expect(guarded.writes.has('src/added.ts')).toBe(false)
+    // README: everything outside the notes matches the base, so it is rewritten with the notes kept.
+    expect(decode(guarded.writes.get('README.md'))).toBe(readme('Release 0.2.0', 'Our notes.'))
+    expect(guarded.rewritten).toContain('README.md')
+    expect(guarded.deletes).toEqual([])
+  })
+
+  it('reports the same plan as before for a verified base', () => {
+    const verified = plan(release('0.1.0'))
+    expect(verified.rewritten).toEqual([])
+    expect(verified.notWritten).toEqual([])
+    expect(verified.deletes).toEqual(['src/removed.ts'])
+  })
 })
 
 describe('line-level merge', () => {

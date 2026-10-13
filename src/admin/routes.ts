@@ -1,31 +1,35 @@
 import type { Context, Hono } from 'hono'
-import { currentViewer, sameOrigin, signInResponse } from '../auth/providers.ts'
+import { basicAuthEnvIgnoredNote, basicAuthUsersLists, currentViewer, fromThisSite, signInResponse } from '../auth/providers.ts'
+import { listLocalUsers, storedPasswordAllowed } from '../auth/local-users.ts'
 import type { Viewer } from '../auth/viewer.ts'
 import type { MonitorInput, PageInput, SinkInput } from '../config.ts'
 import type { Deps } from '../deps.ts'
-import { isStorableEnv, refreshAdminConfig, storedEnvKey } from '../deps.ts'
+import { isStorableEnv, refreshAdminConfig } from '../deps.ts'
 import { isValidTimeZone, nowSeconds } from '../util/time.ts'
+import { hasOwn, own } from '../util/own.ts'
 import {
   describeChanges, findMonitor, type Form, FormError, monitorFromForm, monitorRows, pageFromForm, pageList, putMonitor, putPage, putSink,
-  removeMonitor, removePage, removeSink, SINK_FIELDS, sinkEnvName, sinkFromForm, type SinkType, text,
+  removeMonitor, removePage, removeSink, SINK_FIELDS, sinkFromForm, type SinkType, text,
 } from './forms.ts'
 import {
   accessPage, activityPage, mcpPage, mcpTokenCreated, channelForm, channelsPage, diffBlock, generalPage, configurationPage, importPreview, monitorForm, monitorsPage,
-  pageForm, pagesPage, pingUrlPage, revisionPage, type SecretSource,
+  pageForm, pagesPage, pingUrlPage, revisionPage, type SecretSource, type StoredPasswordRow,
 } from './ui.ts'
 import {
-  appendAudit, currentRevision, currentYamlText, listAudit, listRevisions, loadAdminConfig, loadRevision, RevisionConflict, rotatePingToken, saveAdminConfig,
+  appendAudit, auditStatement, currentRevision, currentYamlText, listAudit, listRevisions, loadAdminConfig, loadRevision, RevisionConflict, rotatePingToken, saveAdminConfig,
   type SaveOptions, sendSinkTest,
 } from './service.ts'
 import { type AdminConfig, authorizeAdminToken, canAdmin, envReferences, issueCsrfToken, validateAdminConfig, verifyCsrfToken } from './security.ts'
 import { exportAdminYaml, locateProblems, parseAdminYaml, stringifyAdminYaml } from './yaml.ts'
 import { configSchema } from './config-schema.ts'
 import { lineDiff, withContext } from './diff.ts'
-import { syncConfig } from '../sync.ts'
+import { collidingChannel, forgetChannelStatements } from './channel-credentials.ts'
+import { hasPingToken, syncConfig } from '../sync.ts'
 import { readRecoverySession } from '../setup/recovery.ts'
 import { beginSetup } from '../setup/state.ts'
 import { deleteCookie } from 'hono/cookie'
 import { checkForUpdate } from '../updates.ts'
+import { cadenceViolations } from '../maintenance.ts'
 import { mountAccessSwitch } from './access-switch.ts'
 import { createApiToken, isMcpScope, listApiTokens, revokeApiToken } from '../mcp/tokens.ts'
 import { APP_VERSION } from '../version.ts'
@@ -47,7 +51,11 @@ const NOTICES: Record<string, string> = {
   'channel-saved': 'Alert channel saved.',
   'channel-deleted': 'Alert channel deleted.',
   'test-sent': 'Test alert sent.',
-  'admins-saved': 'Administrators saved.',
+  'admins-saved': 'Administrators saved. Anyone no longer an administrator lost the password stored in the site, if they had one.',
+  'password-removed': 'Stored password removed. That address can no longer sign in with it.',
+  // A fixed sentence (notices never carry free text); the address is the one just removed.
+  'password-removed-env-admin': 'Stored password removed. Warning: BASIC_AUTH_USERS still lists that address, which is still an administrator, so that entry now signs it in with administrator access. Remove or rotate that entry in the BASIC_AUTH_USERS secret unless that is intended.',
+  'password-missing': 'That address has no password stored in the site.',
   imported: 'Configuration imported.',
   restored: 'Earlier version restored.',
   'setup-ping-urls': 'Setup is complete. Scheduled jobs marked "No ping URL yet" need one: open each and create its ping URL.',
@@ -58,6 +66,7 @@ const NOTICES: Record<string, string> = {
   'method-cancelled': 'The sign-in method was not changed.',
   'method-expired': 'That change expired after an hour. Start again.',
   'method-changed': 'Sign-in method changed. Everyone else signs in again with the new method.',
+  'method-changed-env': 'Sign-in method changed. Everyone else signs in again with the new method. BASIC_AUTH_USERS still lists your address: that entry is now ignored, because the password stored in the site takes precedence. Remove it from the BASIC_AUTH_USERS secret.',
   'mcp-token-revoked': 'Token revoked. Clients using it can no longer connect.',
   'home-saved': 'Home page changed.',
   'update-available': 'A new version is available.',
@@ -112,7 +121,7 @@ export function mountAdminRoutes(app: Hono, deps: Deps): void {
     if (viewer instanceof Response) return viewer
     const csrf = await issueCsrfToken(deps.db, c, nowSeconds())
     if (!csrf) return c.text('Your session is invalid. Please sign in again.', 401, noStore)
-    return { viewer, csrf, config: await storedConfig(), notice: NOTICES[c.req.query('notice') ?? ''] }
+    return { viewer, csrf, config: await storedConfig(), notice: own(NOTICES, c.req.query('notice') ?? '') }
   }
 
   /**
@@ -123,7 +132,7 @@ export function mountAdminRoutes(app: Hono, deps: Deps): void {
     const viewer = await browserAdmin(c)
     if (viewer === null) return notFound(c)
     if (viewer instanceof Response) return viewer
-    if (!sameOrigin(c, deps)) return c.text('Forbidden', 403, noStore)
+    if (!fromThisSite(c, deps)) return c.text('Forbidden', 403, noStore)
     const form = await c.req.parseBody({ all: true }).catch(() => ({})) as Form
     if (!(await verifyCsrfToken(deps.db, c, form.csrf, nowSeconds()))) return c.text('Forbidden', 403, noStore)
     const base = /^\d+$/.test(text(form, 'revision')) ? Number(text(form, 'revision')) : undefined
@@ -148,25 +157,14 @@ export function mountAdminRoutes(app: Hono, deps: Deps): void {
     try { normalized = validateAdminConfig({ ...next, admin: true }, deps.getEnv).normalized } catch (error) { return opts.yaml ? locateProblems(opts.yaml, (error as Error).message) : (error as Error).message }
     if (!canAdmin(viewer, normalized)) return 'This change would remove your own access to Settings. Ask another administrator to make it.'
     const now = nowSeconds()
-    // Checked before secrets are stored, so a refused save leaves nothing behind.
     if (p.base !== undefined) {
       const current = await currentRevision(deps.db)
       if (current !== p.base) { formRevision.set(p.c.req.raw, current); return CONFLICT }
     }
-    if (secrets.length) {
-      await deps.db.batch([
-        ...secrets.map(({ name, value }) => ({
-          sql: `INSERT INTO instance_secrets (name, value, created_at) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET value = excluded.value, created_at = excluded.created_at`,
-          params: [storedEnvKey(name), value, now],
-        })),
-        ...secrets.map(({ name }) => ({
-          sql: `INSERT INTO audit_log (actor, action, target, before_json, after_json, at) VALUES (?, 'setting.store', ?, NULL, NULL, ?)`,
-          params: [viewer.email, name, now],
-        })),
-      ])
-    }
     try {
-      await saveAdminConfig(deps.db, { ...next, admin: true }, viewer.email, now, deps.getEnv, { ...opts, base: p.base })
+      // Entered credentials are stored in the same batch as the configuration, after the name and
+      // binding checks, so a refused save leaves the stored credential and its binding untouched.
+      await saveAdminConfig(deps.db, { ...next, admin: true }, viewer.email, now, deps.getEnv, { ...opts, base: p.base, secrets, hasRealEnv: deps.hasRealEnv })
     } catch (error) {
       if (error instanceof RevisionConflict) { formRevision.set(p.c.req.raw, error.current); return CONFLICT }
       return (error as Error).message
@@ -188,10 +186,31 @@ export function mountAdminRoutes(app: Hono, deps: Deps): void {
 Alert links, ping URLs and sign-in callbacks use ${esc(configured)}. If the site has moved, <a href="/admin">change the address</a>.${oidc ? ` Single sign-on also needs the new callback URL, <code>${esc(here)}/auth/callback</code>, registered with your identity provider.` : ''}</div>`
   }
 
+  /**
+   * Says when the stored configuration could not be loaded (an earlier version, or only the sign-in
+   * settings, are in use), or loaded with settings an older release accepted left out or adjusted.
+   */
+  const configBanner = (): string => {
+    const esc = (v: string) => v.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+    const list = (items: string[]) => `<ul>${items.slice(0, 20).map((item) => `<li>${esc(item)}</li>`).join('')}</ul>`
+    const fallback = deps.configFallback
+    if (fallback) {
+      const problems = fallback.problem.split('\n').map((line) => line.replace(/^\s*-\s*/, '').trim()).filter((line) => line && !/^(Invalid StatusPing config|Unsafe admin config):?$/.test(line))
+      const using = fallback.revision === null
+        ? 'No earlier version loads either, so only the sign-in settings are in use and <strong>no checks are running</strong>.'
+        : `Version ${fallback.revision} from <a href="/admin/configuration">Configuration → History</a> is in use until it is fixed, with the sign-in and page access rules of the stored configuration and without monitors or alert channels deleted since.`
+      return `<div class="alert error banner" role="alert"><strong>The stored configuration is invalid and could not be loaded.</strong> ${using}
+Fix it in <a href="/admin/configuration">Configuration</a> (edit or import the YAML), or restore a version from History.${list(problems)}</div>`
+    }
+    if (!deps.configWarnings.length) return ''
+    return `<div class="alert warning banner" role="status"><strong>Some stored settings were left out or adjusted so the configuration could load.</strong>
+They are refused when saving, so fix them in <a href="/admin/configuration">Configuration</a>.${list(deps.configWarnings)}</div>`
+  }
+
   /** Every form carries the revision it was rendered from, next to its CSRF value. */
-  const html = (c: Context, body: string, status: 200 | 400 = 200) => {
+  const html = (c: Context, body: string, status: 200 | 400 | 409 | 429 = 200) => {
     const revision = formRevision.get(c.req.raw) ?? deps.configRevision
-    const page = body.replace(/(<input type="hidden" name="csrf" value="[^"]*">)/g, `$1<input type="hidden" name="revision" value="${revision}">`).replace('<!--banner-->', addressBanner(c))
+    const page = body.replace(/(<input type="hidden" name="csrf" value="[^"]*">)/g, `$1<input type="hidden" name="revision" value="${revision}">`).replace('<!--banner-->', () => configBanner() + addressBanner(c))
     return c.html(page, status, noStore)
   }
   const formValues = (form: Form): Record<string, string> =>
@@ -200,8 +219,8 @@ Alert links, ping URLs and sign-in callbacks use ${esc(configured)}. If the site
   // ── General ───────────────────────────────────────────────────────────────────────────────
 
   const general = async (c: Context, v: { viewer: Viewer; csrf: string; config: AdminConfig; notice?: string }, error?: string, status: 200 | 400 = 200, resetError?: string) => {
-    const update = await checkForUpdate({ db: deps.db, config: deps.config, fetch: deps.fetch, now: nowSeconds() })
-    return html(c, generalPage({ viewer: v.viewer, csrf: v.csrf, title: v.config.title, baseUrl: v.config.baseUrl, timezone: v.config.timezone ?? 'UTC', updatesEnabled: v.config.updates?.enabled === true, installedVersion: APP_VERSION, update, notice: v.notice, error, resetError }), status)
+    const update = await checkForUpdate({ db: deps.db, config: deps.config, fetch: deps.fetch, targetGuard: deps.targetGuard, now: nowSeconds() })
+    return html(c, generalPage({ viewer: v.viewer, csrf: v.csrf, title: v.config.title, baseUrl: v.config.baseUrl, timezone: v.config.timezone ?? 'UTC', updatesEnabled: v.config.updates?.enabled === true, installedVersion: APP_VERSION, update, cadence: cadenceViolations(deps.config.maintenance), notice: v.notice, error, resetError }), status)
   }
 
   app.get('/admin', async (c) => {
@@ -239,7 +258,7 @@ Alert links, ping URLs and sign-in callbacks use ${esc(configured)}. If the site
   app.post('/admin/updates/check', async (c) => {
     const p = await post(c)
     if (p instanceof Response) return p
-    const result = await checkForUpdate({ db: deps.db, config: deps.config, fetch: deps.fetch, now: nowSeconds(), force: true })
+    const result = await checkForUpdate({ db: deps.db, config: deps.config, fetch: deps.fetch, targetGuard: deps.targetGuard, now: nowSeconds(), force: true })
     await appendAudit(deps.db, { actor: p.viewer.email, action: 'update.check', target: result.targetVersion ? `release:${result.targetVersion}` : 'release:none', before: null, after: null, at: nowSeconds() })
     return done(c, '/admin', `update-${result.result}`)
   })
@@ -273,7 +292,7 @@ Alert links, ping URLs and sign-in callbacks use ${esc(configured)}. If the site
     try {
       const monitor = monitorFromForm(p.form, undefined, new Set(monitorRows(p.config).map((r) => r.monitor.id)))
       const result = await save(p, putMonitor(p.config, monitor, text(p.form, 'group')))
-      if (!result && monitor.kind === 'push' && !deps.pingTokens[monitor.id]) {
+      if (!result && monitor.kind === 'push' && !hasPingToken(deps.pingTokens, monitor.id)) {
         // A new scheduled job gets its ping URL right away; it is shown only this once.
         await syncConfig(deps, nowSeconds())
         const token = await rotatePingToken(deps.db, monitor.id, p.viewer.email, nowSeconds())
@@ -395,7 +414,7 @@ Alert links, ping URLs and sign-in callbacks use ${esc(configured)}. If the site
   // ── Alert channels ────────────────────────────────────────────────────────────────────────
 
   const channelRows = (config: AdminConfig) => Object.entries(config.sinks ?? {}).map(([name, sink]) => ({ name, type: sink.type }))
-  const typeParam = (value: string | undefined): SinkType => (value && value in SINK_FIELDS ? value as SinkType : 'slack')
+  const typeParam = (value: string | undefined): SinkType => (value && hasOwn(SINK_FIELDS, value) ? value as SinkType : 'slack')
 
   /** Where each credential of a channel comes from. Values are never read for display. */
   const sources = (sink: SinkInput | undefined): Record<string, { source: SecretSource; envName?: string }> => {
@@ -406,7 +425,7 @@ Alert links, ping URLs and sign-in callbacks use ${esc(configured)}. If the site
     for (const [key, value] of Object.entries(refs)) {
       const name = value && typeof value === 'object' && typeof (value as { $env?: unknown }).$env === 'string' ? (value as { $env: string }).$env : undefined
       if (!name) continue
-      out[key] = { envName: name, source: deps.hasRealEnv(name) ? 'env' : isStorableEnv(name) && deps.storedEnv[name] ? 'db' : false }
+      out[key] = { envName: name, source: deps.hasRealEnv(name) ? 'env' : isStorableEnv(name) && own(deps.storedEnv, name) ? 'db' : false }
     }
     return out
   }
@@ -426,7 +445,7 @@ Alert links, ping URLs and sign-in callbacks use ${esc(configured)}. If the site
   const saveChannel = async (c: Context, name: string | undefined) => {
     const p = await post(c)
     if (p instanceof Response) return p
-    const existing = name ? p.config.sinks?.[name] : undefined
+    const existing = name ? own(p.config.sinks, name) : undefined
     if (name && !existing) return notFound(c)
     const type = existing?.type ?? typeParam(text(p.form, 'type'))
     let error: string
@@ -434,12 +453,14 @@ Alert links, ping URLs and sign-in callbacks use ${esc(configured)}. If the site
       const channel = name ?? text(p.form, 'name')
       if (!name) {
         if (!/^[A-Za-z0-9_-]{1,40}$/.test(channel)) throw new FormError('Use letters, numbers, - and _ for the channel name.')
-        if (p.config.sinks?.[channel]) throw new FormError(`A channel named "${channel}" already exists.`)
+        if (hasOwn(p.config.sinks, channel)) throw new FormError(`A channel named "${channel}" already exists.`)
+        const close = collidingChannel(p.config, channel)
+        if (close) throw new FormError(`The name is too close to the channel "${close}". Choose a different name.`)
       }
       const { sink, secrets } = sinkFromForm(p.form, channel, existing)
       // Validate with the new values visible, so a just-entered credential counts as set.
       const pending = Object.fromEntries(secrets.map((s) => [s.name, s.value]))
-      const getEnv = (env: string) => pending[env] ?? deps.getEnv(env)
+      const getEnv = (env: string) => own(pending, env) ?? deps.getEnv(env)
       try { validateAdminConfig({ ...putSink(p.config, channel, sink), admin: true }, getEnv) } catch (e) { throw new FormError((e as Error).message) }
       const result = await save(p, putSink(p.config, channel, sink), secrets)
       if (!result) return done(c, '/admin/channels', name ? 'channel-saved' : 'channel-added')
@@ -454,7 +475,7 @@ Alert links, ping URLs and sign-in callbacks use ${esc(configured)}. If the site
     const v = await view(c)
     if (v instanceof Response) return v
     const name = c.req.param('name')
-    const sink = v.config.sinks?.[name]
+    const sink = own(v.config.sinks, name)
     if (!sink) return notFound(c)
     return html(c, channelForm({ viewer: v.viewer, csrf: v.csrf, type: sink.type, name, sink, sources: sources(sink) }))
   })
@@ -465,12 +486,13 @@ Alert links, ping URLs and sign-in callbacks use ${esc(configured)}. If the site
     const p = await post(c)
     if (p instanceof Response) return p
     const name = c.req.param('name')
-    if (!p.config.sinks?.[name]) return notFound(c)
-    const error = await save(p, removeSink(p.config, name))
+    const sink = own(p.config.sinks, name)
+    if (!sink) return notFound(c)
+    const remaining = removeSink(p.config, name)
+    const error = await save(p, remaining)
     if (error) return html(c, channelsPage({ viewer: p.viewer, csrf: p.csrf, sinks: channelRows(p.config), error }), 400)
-    // Erase the credentials this channel stored (exact prefix match; LIKE would treat _ as a wildcard).
-    const prefix = storedEnvKey(sinkEnvName(name, ''))
-    await deps.db.run(`DELETE FROM instance_secrets WHERE substr(name, 1, ?) = ?`, [prefix.length, prefix])
+    // Erase the credentials this channel stored, by exact name.
+    await deps.db.batch(forgetChannelStatements(name, sink.type, remaining))
     await refreshAdminConfig(deps, nowSeconds())
     return done(c, '/admin/channels', 'channel-deleted')
   })
@@ -490,10 +512,47 @@ Alert links, ping URLs and sign-in callbacks use ${esc(configured)}. If the site
 
   // ── Access ────────────────────────────────────────────────────────────────────────────────
 
+  /** Passwords stored in the site, for Settings → Access (addresses only, never hashes). */
+  const realEnv = (name: string) => (deps.hasRealEnv(name) ? deps.getEnv(name) : undefined)
+  const storedPasswords = async (viewer: Viewer): Promise<StoredPasswordRow[]> => {
+    return (await listLocalUsers(deps.db)).map((u) => {
+      const allowed = storedPasswordAllowed(deps.config.access, u.email)
+      // The env entry is ignored only while the stored password is in force.
+      const envIgnored = allowed && basicAuthUsersLists(realEnv, u.email) ? basicAuthEnvIgnoredNote(u.email) : null
+      return { ...u, allowed, envIgnored, self: u.email === viewer.email.trim().toLowerCase() }
+    })
+  }
+  const accessView = async (c: Context, v: { viewer: Viewer; csrf: string; config: AdminConfig; notice?: string }, extra: { values?: Record<string, string>; error?: string } = {}) =>
+    html(c, accessPage({
+      viewer: v.viewer, csrf: v.csrf, providerSummary: providerSummary(v.config), admins: v.config.access?.admins?.emails ?? [], notice: v.notice,
+      storedPasswords: await storedPasswords(v.viewer), basic: deps.config.access?.provider.type === 'basic', ...extra,
+    }), extra.error ? 400 : 200)
+
   app.get('/admin/access', async (c) => {
     const v = await view(c)
     if (v instanceof Response) return v
-    return html(c, accessPage({ viewer: v.viewer, csrf: v.csrf, providerSummary: providerSummary(v.config), admins: v.config.access?.admins?.emails ?? [], notice: v.notice }))
+    return accessView(c, v)
+  })
+
+  /** Removes one password stored in the site (BASIC_AUTH_USERS rotation does not revoke it). */
+  app.post('/admin/access/passwords/remove', async (c) => {
+    const p = await post(c)
+    if (p instanceof Response) return p
+    const email = text(p.form, 'email').toLowerCase()
+    if (email === p.viewer.email.trim().toLowerCase()) {
+      return accessView(c, p, { error: 'You cannot remove your own stored password. Ask another administrator, or run npm run cli -- remove-user on Node.' })
+    }
+    const row = email ? await deps.db.first<{ email: string }>(`SELECT email FROM local_users WHERE email = ?`, [email]) : null
+    if (!row) return done(c, '/admin/access', 'password-missing')
+    const now = nowSeconds()
+    await deps.db.batch([
+      { sql: `DELETE FROM local_users WHERE email = ?`, params: [email] },
+      auditStatement({ actor: p.viewer.email, action: 'access.password-remove', target: `local-user:${email}`, before: null, after: null, at: now }),
+    ])
+    // An old BASIC_AUTH_USERS entry for an address that is still an administrator signs it in
+    // again from now on (the stored password no longer takes precedence): say so.
+    const envSignsAdminIn = storedPasswordAllowed(deps.config.access, email) && basicAuthUsersLists(realEnv, email)
+    return done(c, '/admin/access', envSignsAdminIn ? 'password-removed-env-admin' : 'password-removed')
   })
 
   app.post('/admin/access', async (c) => {
@@ -503,7 +562,7 @@ Alert links, ping URLs and sign-in callbacks use ${esc(configured)}. If the site
     const admins = { ...(p.config.access?.admins ?? {}), emails }
     const error = !emails.length && !p.config.access?.admins?.teams?.length ? 'Keep at least one administrator.'
       : p.config.access ? await save(p, { ...p.config, access: { ...p.config.access, admins } }) : 'No sign-in method is configured.'
-    if (error) return html(c, accessPage({ viewer: p.viewer, csrf: p.csrf, providerSummary: providerSummary(p.config), admins: p.config.access?.admins?.emails ?? [], values: formValues(p.form), error }), 400)
+    if (error) return accessView(c, p, { values: formValues(p.form), error })
     return done(c, '/admin/access', 'admins-saved')
   })
 
@@ -522,7 +581,7 @@ Alert links, ping URLs and sign-in callbacks use ${esc(configured)}. If the site
 
   /** Where each $env name the configuration uses is set. Names only, never values. */
   const envStatus = (config: AdminConfig) => envReferences(config).map(({ name, paths }) => ({
-    name, paths, source: (deps.hasRealEnv(name) ? 'env' : isStorableEnv(name) && deps.storedEnv[name] ? 'db' : false) as SecretSource,
+    name, paths, source: (deps.hasRealEnv(name) ? 'env' : isStorableEnv(name) && own(deps.storedEnv, name) ? 'db' : false) as SecretSource,
   }))
   const schemaUrl = () => `${deps.config.baseUrl.replace(/\/+$/, '')}/admin/schema.json`
   const currentYaml = async (config: AdminConfig) => exportAdminYaml(config, await currentYamlText(deps.db), schemaUrl())
@@ -710,7 +769,13 @@ Alert links, ping URLs and sign-in callbacks use ${esc(configured)}. If the site
       }
       // Admin mode is always on for a stored configuration; a file may leave the flag out.
       if (value && typeof value === 'object' && !Array.isArray(value) && !('admin' in value)) value = { ...value, admin: true }
-      const saved = await saveAdminConfig(deps.db, value, 'api-token', nowSeconds(), deps.getEnv, { base, yaml, action: 'config.api' })
+      // As with an import, the sign-in method stays as it is: change it in Settings → Access.
+      const current = (await storedConfig()).access
+      if (current && value && typeof value === 'object' && !Array.isArray(value)) {
+        const next = value as AdminConfig
+        value = { ...next, access: { ...(next.access ?? {}), provider: current.provider } }
+      }
+      const saved = await saveAdminConfig(deps.db, value, 'api-token', nowSeconds(), deps.getEnv, { base, yaml, action: 'config.api', hasRealEnv: deps.hasRealEnv })
       await refreshAdminConfig(deps, nowSeconds())
       return c.json({ config: saved.config, updatedAt: saved.updatedAt, revision: saved.revision }, 200, { ...noStore, etag: etag(saved.revision) })
     } catch (error) {
